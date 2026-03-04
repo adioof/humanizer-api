@@ -144,16 +144,36 @@ class AIDetector {
   constructor(config = {}) {
     this.provider = config.provider || 'gptzero';
     this.apiKey = config.apiKey;
+    this.model = config.model;
   }
 
   async detect(text) {
+    if (this.provider === 'inhouse') return this._inhouse(text);
+
     if (!this.apiKey) {
       return { score: 0, human_score: 1, sentences: [], skipped: true };
     }
 
     if (this.provider === 'gptzero') return this._gptzero(text);
     if (this.provider === 'sapling') return this._sapling(text);
+    if (this.provider === 'inhouse') return this._inhouse(text);
     throw new Error(`Unknown detector provider: ${this.provider}`);
+  }
+
+  async _inhouse(text) {
+    // Uses the in-house detector (OpenAI logprobs + perplexity/burstiness)
+    const { detect } = require('./detector');
+    const result = await detect(text, this.apiKey, { model: this.model || 'gpt-4o-mini' });
+    return {
+      provider: 'inhouse',
+      score: (100 - result.score) / 100, // convert: detector gives 0-100 human, we need 0-1 AI
+      human_score: result.score / 100,
+      sentences: (result.flagged_sentences || []).map(s => ({
+        text: s.text,
+        prob: 1 - (s.perplexity / 60), // rough conversion
+      })),
+      metrics: result.metrics,
+    };
   }
 
   _gptzero(text) {
@@ -293,9 +313,14 @@ async function humanize(text, options = {}) {
     baseUrl: options.llm_base_url,
   });
 
+  // Default to in-house detection if no third-party detector key provided
+  const detectorProvider = options.detector_provider || (options.detector_api_key ? 'gptzero' : 'inhouse');
+  const detectorKey = detectorProvider === 'inhouse' ? options.llm_api_key : options.detector_api_key;
+
   const detector = new AIDetector({
-    provider: options.detector_provider || 'gptzero',
-    apiKey: options.detector_api_key,
+    provider: detectorProvider,
+    apiKey: detectorKey,
+    model: options.llm_model,
   });
 
   const maxRetries = options.max_retries ?? 2;

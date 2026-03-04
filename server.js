@@ -1,5 +1,6 @@
 const http = require('http');
 const { humanize, detectOnly } = require('./humanizer');
+const { detect: detectInHouse } = require('./detector');
 const { Auth } = require('./auth');
 const { StripeClient, PLANS } = require('./stripe');
 
@@ -208,11 +209,23 @@ route('POST', '/api/v1/detect', async (req, res) => {
   const body = parseJSON(rawBody);
   if (!body?.text) return json(res, { error: 'text is required' }, 400);
 
+  // In-house detection (default) — uses OpenAI logprobs, no third-party API needed
+  const provider = body.detector_provider || body.provider || 'inhouse';
+
+  if (provider === 'inhouse') {
+    const openaiKey = body.llm_api_key || body.openai_api_key || LLM_API_KEY;
+    if (!openaiKey) return json(res, { error: 'llm_api_key or openai_api_key required for in-house detection' }, 400);
+    const result = await detectInHouse(body.text, openaiKey, { model: body.model || 'gpt-4o-mini' });
+    json(res, result);
+    return;
+  }
+
+  // Third-party detection (gptzero, sapling)
   const detectorKey = body.detector_api_key || GPTZERO_API_KEY;
   if (!detectorKey) return json(res, { error: 'detector_api_key required' }, 400);
 
   const result = await detectOnly(body.text, {
-    provider: body.detector_provider || 'gptzero',
+    provider,
     apiKey: detectorKey,
   });
   json(res, result);
