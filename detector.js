@@ -1,49 +1,149 @@
 const https = require('https');
 
 // ============================================================
-// IN-HOUSE AI DETECTOR
-// Uses perplexity (token predictability) + burstiness (variance)
-// No third-party detector API needed — just OpenAI logprobs
+// IN-HOUSE AI DETECTOR v5
+// Multi-signal approach:
+// 1. Vocabulary richness (type-token ratio, hapax legomena)
+// 2. Sentence length burstiness
+// 3. Structural predictability (transition patterns)
+// 4. OpenAI logprobs for spot-checking flagged sentences
 // ============================================================
 
-const TOKENIZE_MODEL = 'gpt-4o-mini'; // cheap, fast, has logprobs
+/**
+ * Split text into sentences
+ */
+function splitSentences(text) {
+  const raw = text.split(/(?<=[.!?])\s+|\n\n+/);
+  return raw.map(s => s.trim()).filter(s => s.length > 10);
+}
 
 /**
- * Get predictability of a sentence given its context.
- * 
- * Approach: Feed prior context + first half of sentence as a prompt.
- * Ask the model to continue. Measure word overlap with actual second half.
- * High overlap = model can predict this text = likely AI-generated.
- * 
- * Context is key — AI text is predictable IN CONTEXT, not in isolation.
+ * Tokenize into words (lowercase, strip punctuation)
  */
-function predictSentence(sentence, priorContext, apiKey, model = TOKENIZE_MODEL) {
-  const words = sentence.split(/\s+/);
-  if (words.length < 4) return Promise.resolve({ predictability: 0, avgLogprob: -5 });
+function tokenize(text) {
+  return text.toLowerCase()
+    .replace(/[^a-z0-9\s'-]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 1);
+}
 
-  // Give first 40% as prompt, predict the remaining 60%
+/**
+ * Signal 1: Vocabulary Richness
+ * AI text uses more generic, common vocabulary.
+ * Human text has more unique words, unusual word choices.
+ */
+function vocabRichness(words) {
+  if (words.length < 20) return { ttr: 0.5, hapaxRatio: 0.5 };
+
+  const unique = new Set(words);
+  const ttr = unique.size / words.length; // Type-Token Ratio
+
+  // Hapax legomena: words that appear exactly once
+  const freq = {};
+  for (const w of words) freq[w] = (freq[w] || 0) + 1;
+  const hapax = Object.values(freq).filter(c => c === 1).length;
+  const hapaxRatio = hapax / unique.size;
+
+  return { ttr: Math.round(ttr * 1000) / 1000, hapaxRatio: Math.round(hapaxRatio * 1000) / 1000 };
+}
+
+/**
+ * Signal 2: Sentence Length Burstiness
+ * AI = uniform sentence lengths, Human = varied
+ */
+function calcBurstiness(values) {
+  if (values.length < 2) return 0;
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  if (mean === 0) return 0;
+  const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length;
+  return Math.round((Math.sqrt(variance) / mean) * 1000) / 1000;
+}
+
+/**
+ * Signal 3: AI-typical patterns
+ * Count transition phrases, filler phrases, and structural patterns common in AI text
+ */
+const AI_PATTERNS = [
+  /\bin (?:the|today's) (?:rapidly |ever-)?(?:evolving|changing) (?:landscape|world)/i,
+  /\blet's (?:dive|delve|explore|unpack)/i,
+  /\bit'?s worth noting/i,
+  /\bin (?:this|today's) (?:article|post|guide)/i,
+  /\bgame[- ]changer/i,
+  /\blever(?:age|aging)/i,
+  /\bcomprehensive (?:guide|overview|look)/i,
+  /\bstream ?line/i,
+  /\brobust (?:solution|framework|system|platform)/i,
+  /\bcutting[- ]edge/i,
+  /\bunprecedented (?:opportunity|growth|level)/i,
+  /\btransformative/i,
+  /\bseamless(?:ly)? integrat/i,
+  /\bholistic approach/i,
+  /\bparadigm shift/i,
+  /\bin conclusion/i,
+  /\bfurthermore,/i,
+  /\bmoreover,/i,
+  /\bconsequently,/i,
+  /\bnevertheless,/i,
+  /\bsignificant(?:ly)? (?:enhance|improve|boost|impact)/i,
+  /\bundoubtedly/i,
+  /\bempowe?r(?:ing|s)? (?:developer|team|user|organization)/i,
+  /\bfoster(?:ing|s)? (?:innovation|collaboration|growth)/i,
+  /\bnavigate (?:the|this) (?:complex|changing)/i,
+];
+
+function countAIPatterns(text) {
+  let count = 0;
+  for (const pattern of AI_PATTERNS) {
+    if (pattern.test(text)) count++;
+  }
+  return count;
+}
+
+/**
+ * Signal 4: Sentence start diversity
+ * AI tends to start sentences with similar structures
+ */
+function sentenceStartDiversity(sentences) {
+  if (sentences.length < 3) return 1;
+  const starts = sentences.map(s => {
+    const words = s.split(/\s+/).slice(0, 2).join(' ').toLowerCase();
+    return words;
+  });
+  const unique = new Set(starts);
+  return Math.round((unique.size / starts.length) * 1000) / 1000;
+}
+
+/**
+ * Signal 5: Paragraph length variation
+ */
+function paragraphVariation(text) {
+  const paragraphs = text.split(/\n\n+/).filter(p => p.trim().length > 0);
+  if (paragraphs.length < 2) return 0.5;
+  const lengths = paragraphs.map(p => p.split(/\s+/).length);
+  return calcBurstiness(lengths);
+}
+
+/**
+ * Optional: OpenAI spot-check for flagged sentences
+ */
+function spotCheck(sentence, priorContext, apiKey, model = 'gpt-4o-mini') {
+  const words = sentence.split(/\s+/);
+  if (words.length < 5) return Promise.resolve({ predictability: 0 });
+
   const splitPoint = Math.max(2, Math.floor(words.length * 0.4));
   const prefix = words.slice(0, splitPoint).join(' ');
-  const expected = words.slice(splitPoint).join(' ');
-  const expectedWordCount = words.length - splitPoint;
-
-  // Include up to 200 words of prior context for better prediction
-  const contextWords = priorContext.split(/\s+/).slice(-200).join(' ');
+  const expected = words.slice(splitPoint);
+  const contextWords = priorContext.split(/\s+/).slice(-150).join(' ');
   const fullPrompt = contextWords ? `${contextWords} ${prefix}` : prefix;
 
   const body = JSON.stringify({
     model,
     messages: [
-      {
-        role: 'system',
-        content: 'Continue the following text naturally. Write exactly the next ' + expectedWordCount + ' words. Do not explain, do not add anything extra.'
-      },
+      { role: 'system', content: 'Continue this text naturally. Write the next ' + expected.length + ' words only.' },
       { role: 'user', content: fullPrompt }
     ],
-    max_tokens: Math.min(150, expectedWordCount * 3),
+    max_tokens: Math.min(100, expected.length * 3),
     temperature: 0,
-    logprobs: true,
-    top_logprobs: 3,
   });
 
   return new Promise((resolve, reject) => {
@@ -55,258 +155,152 @@ function predictSentence(sentence, priorContext, apiKey, model = TOKENIZE_MODEL)
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
-      timeout: 30000,
+      timeout: 20000,
     }, res => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        if (res.statusCode >= 400) {
-          reject(new Error(`OpenAI error ${res.statusCode}: ${data.slice(0, 300)}`));
-          return;
-        }
+        if (res.statusCode >= 400) { reject(new Error(`OpenAI ${res.statusCode}`)); return; }
         try {
           const parsed = JSON.parse(data);
-          const content = parsed.choices?.[0]?.logprobs?.content || [];
           const completion = parsed.choices?.[0]?.message?.content || '';
-
-          // Word-level overlap (case-insensitive, punctuation-stripped)
           const normalize = w => w.toLowerCase().replace(/[^a-z0-9]/g, '');
-          const expectedArr = expected.split(/\s+/).map(normalize).filter(w => w.length > 0);
-          const completionArr = completion.split(/\s+/).map(normalize).filter(w => w.length > 0);
-
-          // Sliding window match — check if expected words appear in order in completion
-          let matchCount = 0;
-          let compIdx = 0;
-          for (const ew of expectedArr) {
-            // Look ahead up to 3 positions for a match (allows small insertions)
-            for (let look = 0; look < 3 && compIdx + look < completionArr.length; look++) {
-              if (completionArr[compIdx + look] === ew) {
-                matchCount++;
-                compIdx = compIdx + look + 1;
-                break;
-              }
+          const expArr = expected.map(normalize).filter(w => w);
+          const compArr = completion.split(/\s+/).map(normalize).filter(w => w);
+          let match = 0, ci = 0;
+          for (const ew of expArr) {
+            for (let look = 0; look < 3 && ci + look < compArr.length; look++) {
+              if (compArr[ci + look] === ew) { match++; ci = ci + look + 1; break; }
             }
           }
-
-          const predictability = expectedArr.length > 0 ? matchCount / expectedArr.length : 0;
-
-          // Model confidence (how sure it was about its own output)
-          const avgLogprob = content.length > 0
-            ? content.reduce((s, t) => s + (t.logprob || 0), 0) / content.length
-            : -5;
-
-          // Confidence = how sure the model was about its own output
-          const confidence = Math.exp(avgLogprob); // 0-1
-
-          // Combined: predictability is the primary signal
-          // Confidence only boosts when predictability is already moderate+
-          // This prevents high-confidence-but-wrong completions from inflating scores
-          const combinedScore = predictability >= 0.15
-            ? predictability * 0.85 + confidence * 0.15
-            : predictability;
-
-          resolve({
-            predictability,
-            confidence,
-            combinedScore,
-            avgLogprob,
-          });
-        } catch (e) {
-          reject(new Error('Failed to parse logprobs response'));
-        }
+          resolve({ predictability: expArr.length > 0 ? match / expArr.length : 0 });
+        } catch (e) { reject(e); }
       });
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Logprobs timeout')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     req.write(body);
     req.end();
   });
 }
 
 /**
- * Split text into sentences (simple but effective)
- */
-function splitSentences(text) {
-  // Split on sentence-ending punctuation followed by space or newline
-  const raw = text.split(/(?<=[.!?])\s+|\n\n+/);
-  return raw
-    .map(s => s.trim())
-    .filter(s => s.length > 10); // skip tiny fragments
-}
-
-/**
- * Calculate perplexity from logprobs
- * Perplexity = exp(-1/N * sum(log_probs))
- */
-function calcPerplexity(logprobs) {
-  if (!logprobs.length) return 0;
-  const avgLogprob = logprobs.reduce((sum, t) => sum + (t.logprob || 0), 0) / logprobs.length;
-  return Math.exp(-avgLogprob);
-}
-
-/**
- * Calculate burstiness (coefficient of variation of sentence lengths)
- */
-function calcBurstiness(sentenceLengths) {
-  if (sentenceLengths.length < 2) return 0;
-  const mean = sentenceLengths.reduce((a, b) => a + b, 0) / sentenceLengths.length;
-  if (mean === 0) return 0;
-  const variance = sentenceLengths.reduce((sum, l) => sum + (l - mean) ** 2, 0) / sentenceLengths.length;
-  const stdDev = Math.sqrt(variance);
-  return stdDev / mean; // coefficient of variation
-}
-
-/**
- * Calculate burstiness of perplexity across sentences
- */
-function calcPerplexityBurstiness(perplexities) {
-  if (perplexities.length < 2) return 0;
-  const mean = perplexities.reduce((a, b) => a + b, 0) / perplexities.length;
-  if (mean === 0) return 0;
-  const variance = perplexities.reduce((sum, p) => sum + (p - mean) ** 2, 0) / perplexities.length;
-  return Math.sqrt(variance) / mean;
-}
-
-/**
- * Score text: 0 = definitely AI, 100 = definitely human
- * 
- * Thresholds calibrated from research:
- * - AI text: perplexity ~5-20, burstiness ~0.1-0.3
- * - Human text: perplexity ~30-80+, burstiness ~0.5-1.5+
- */
-function computeScore(perplexity, lengthBurstiness, perplexityBurstiness) {
-  // Perplexity score: higher = more human-like
-  // Scale: 5 (AI) → 60+ (human)
-  let perplexityScore;
-  if (perplexity <= 5) perplexityScore = 0;
-  else if (perplexity >= 60) perplexityScore = 100;
-  else perplexityScore = ((perplexity - 5) / 55) * 100;
-
-  // Length burstiness score: higher variance = more human
-  // Scale: 0.1 (AI) → 0.8+ (human)
-  let lengthScore;
-  if (lengthBurstiness <= 0.1) lengthScore = 0;
-  else if (lengthBurstiness >= 0.8) lengthScore = 100;
-  else lengthScore = ((lengthBurstiness - 0.1) / 0.7) * 100;
-
-  // Perplexity burstiness: higher = more human
-  // Scale: 0.15 (AI) → 0.7+ (human)
-  let pBurstScore;
-  if (perplexityBurstiness <= 0.15) pBurstScore = 0;
-  else if (perplexityBurstiness >= 0.7) pBurstScore = 100;
-  else pBurstScore = ((perplexityBurstiness - 0.15) / 0.55) * 100;
-
-  // Weighted combination: perplexity matters most
-  const score = (perplexityScore * 0.5) + (lengthScore * 0.25) + (pBurstScore * 0.25);
-  return Math.round(Math.max(0, Math.min(100, score)));
-}
-
-/**
  * Main detection function
- * Analyzes each sentence for predictability using OpenAI logprobs.
- * Returns: { score: 0-100, metrics, flagged_sentences }
- * score: 0 = AI, 100 = human
+ * Returns: { score: 0-100 (0=AI, 100=human), metrics, flagged_sentences }
  */
 async function detect(text, apiKey, options = {}) {
-  const model = options.model || TOKENIZE_MODEL;
+  const model = options.model || 'gpt-4o-mini';
   const sentences = splitSentences(text);
+  const words = tokenize(text);
 
-  if (sentences.length === 0) {
-    return { score: 50, error: 'No sentences found', details: {} };
+  if (words.length < 20) {
+    return { score: 50, error: 'Text too short for reliable detection' };
   }
 
-  const sentenceLengths = sentences.map(s => s.split(/\s+/).length);
-  const lengthBurstiness = calcBurstiness(sentenceLengths);
+  // ── Signal 1: Vocabulary ──
+  const vocab = vocabRichness(words);
+  // AI: TTR ~0.4-0.55, Human: TTR ~0.55-0.75+
+  let vocabScore;
+  if (vocab.ttr <= 0.4) vocabScore = 0;
+  else if (vocab.ttr >= 0.7) vocabScore = 100;
+  else vocabScore = ((vocab.ttr - 0.4) / 0.3) * 100;
 
-  // Analyze a sample of sentences (max 15 to keep costs down)
-  const sampleSize = Math.min(sentences.length, 15);
-  const step = Math.max(1, Math.floor(sentences.length / sampleSize));
-  const sampled = [];
-  for (let i = 0; i < sentences.length && sampled.length < sampleSize; i += step) {
-    if (sentences[i].split(/\s+/).length >= 4) {
-      sampled.push({ text: sentences[i], index: i });
+  // ── Signal 2: Sentence length burstiness ──
+  const sentLengths = sentences.map(s => s.split(/\s+/).length);
+  const lengthBurst = calcBurstiness(sentLengths);
+  // AI: ~0.15-0.3, Human: ~0.4-1.0+
+  let burstScore;
+  if (lengthBurst <= 0.15) burstScore = 0;
+  else if (lengthBurst >= 0.8) burstScore = 100;
+  else burstScore = ((lengthBurst - 0.15) / 0.65) * 100;
+
+  // ── Signal 3: AI pattern count ──
+  const aiPatterns = countAIPatterns(text);
+  // 0 patterns = human, 3+ = definitely AI
+  let patternScore;
+  if (aiPatterns >= 3) patternScore = 0;
+  else if (aiPatterns === 0) patternScore = 100;
+  else patternScore = (1 - aiPatterns / 3) * 100;
+
+  // ── Signal 4: Sentence start diversity ──
+  const startDiv = sentenceStartDiversity(sentences);
+  // AI: ~0.5-0.7, Human: ~0.8-1.0
+  let divScore;
+  if (startDiv <= 0.5) divScore = 0;
+  else if (startDiv >= 0.95) divScore = 100;
+  else divScore = ((startDiv - 0.5) / 0.45) * 100;
+
+  // ── Signal 5: Paragraph variation ──
+  const paraVar = paragraphVariation(text);
+  let paraScore;
+  if (paraVar <= 0.1) paraScore = 0;
+  else if (paraVar >= 0.7) paraScore = 100;
+  else paraScore = ((paraVar - 0.1) / 0.6) * 100;
+
+  // ── Weighted combination ──
+  const humanScore = Math.round(Math.max(0, Math.min(100,
+    (vocabScore * 0.2) +
+    (burstScore * 0.2) +
+    (patternScore * 0.3) +   // AI patterns are the strongest signal
+    (divScore * 0.15) +
+    (paraScore * 0.15)
+  )));
+
+  // ── Spot-check suspicious sentences with OpenAI ──
+  const flaggedSentences = [];
+
+  if (apiKey && humanScore < 75) {
+    // Only spot-check if the text looks somewhat suspicious
+    const sampled = sentences.slice(0, Math.min(sentences.length, 8));
+    for (let i = 0; i < sampled.length; i++) {
+      if (sampled[i].split(/\s+/).length < 5) continue;
+      try {
+        const priorContext = sentences.slice(0, i).join(' ');
+        const result = await spotCheck(sampled[i], priorContext, apiKey, model);
+        if (result.predictability > 0.4) {
+          flaggedSentences.push({
+            text: sampled[i],
+            predictability: Math.round(result.predictability * 1000) / 1000,
+            word_count: sampled[i].split(/\s+/).length,
+          });
+        }
+      } catch (e) {
+        // Skip failed spot checks
+      }
     }
   }
 
-  // Get predictability for each sampled sentence WITH context
-  const results = [];
-  for (const s of sampled) {
-    // Build prior context from all sentences before this one
-    const priorContext = sentences.slice(0, s.index).join(' ');
-    try {
-      const r = await predictSentence(s.text, priorContext, apiKey, model);
-      results.push({
-        ...s,
-        predictability: r.predictability,
-        confidence: r.confidence,
-        combinedScore: r.combinedScore,
-        avgLogprob: r.avgLogprob,
-      });
-    } catch (e) {
-      results.push({ ...s, predictability: 0.3, confidence: 0.5, combinedScore: 0.3, avgLogprob: -3, error: e.message });
-    }
+  // Adjust score based on spot-check results
+  let adjustedScore = humanScore;
+  if (flaggedSentences.length > 0) {
+    const flaggedRatio = flaggedSentences.length / Math.min(sentences.length, 8);
+    adjustedScore = Math.round(humanScore * (1 - flaggedRatio * 0.3));
   }
-
-  // Average scores across sentences
-  const avgPredictability = results.reduce((s, r) => s + r.predictability, 0) / results.length;
-  const avgCombined = results.reduce((s, r) => s + (r.combinedScore || 0), 0) / results.length;
-  const avgConfidence = results.reduce((s, r) => s + (r.confidence || 0), 0) / results.length;
-  const predictabilities = results.map(r => r.predictability);
-  const predictBurstiness = calcPerplexityBurstiness(predictabilities); // reuse variance calc
-
-  // Combined score:
-  // High (>0.4) = AI, Low (<0.05) = human
-  let predictScore;
-  if (avgCombined >= 0.4) predictScore = 0;
-  else if (avgCombined <= 0.05) predictScore = 100;
-  else predictScore = ((0.4 - avgCombined) / 0.35) * 100;
-
-  // Length burstiness score
-  let lengthScore;
-  if (lengthBurstiness <= 0.1) lengthScore = 0;
-  else if (lengthBurstiness >= 0.8) lengthScore = 100;
-  else lengthScore = ((lengthBurstiness - 0.1) / 0.7) * 100;
-
-  // Predictability burstiness score (varied predictability = more human)
-  let pBurstScore;
-  if (predictBurstiness <= 0.15) pBurstScore = 0;
-  else if (predictBurstiness >= 0.7) pBurstScore = 100;
-  else pBurstScore = ((predictBurstiness - 0.15) / 0.55) * 100;
-
-  // Weighted: predictability matters most
-  const humanScore = Math.round(
-    Math.max(0, Math.min(100,
-      (predictScore * 0.5) + (lengthScore * 0.25) + (pBurstScore * 0.25)
-    ))
-  );
-
-  // Flag highly predictable sentences (combined > 0.4)
-  const flaggedSentences = results
-    .filter(r => (r.combinedScore || 0) > 0.4)
-    .map(r => ({
-      text: r.text,
-      predictability: Math.round(r.predictability * 1000) / 1000,
-      confidence: Math.round((r.confidence || 0) * 1000) / 1000,
-      combined: Math.round((r.combinedScore || 0) * 1000) / 1000,
-      word_count: r.text.split(/\s+/).length,
-    }));
 
   return {
-    score: humanScore,
-    ai_probability: Math.round((100 - humanScore) / 100 * 1000) / 1000,
-    human_probability: Math.round(humanScore / 100 * 1000) / 1000,
+    score: adjustedScore,
+    ai_probability: Math.round((100 - adjustedScore) / 100 * 1000) / 1000,
+    human_probability: Math.round(adjustedScore / 100 * 1000) / 1000,
     metrics: {
-      avg_predictability: Math.round(avgPredictability * 1000) / 1000,
-      avg_confidence: Math.round(avgConfidence * 1000) / 1000,
-      avg_combined: Math.round(avgCombined * 1000) / 1000,
-      length_burstiness: Math.round(lengthBurstiness * 1000) / 1000,
-      predict_burstiness: Math.round(predictBurstiness * 1000) / 1000,
+      vocab_ttr: vocab.ttr,
+      hapax_ratio: vocab.hapaxRatio,
+      length_burstiness: lengthBurst,
+      ai_patterns_found: aiPatterns,
+      sentence_start_diversity: startDiv,
+      paragraph_variation: paraVar,
+    },
+    sub_scores: {
+      vocabulary: Math.round(vocabScore),
+      burstiness: Math.round(burstScore),
+      ai_patterns: Math.round(patternScore),
+      start_diversity: Math.round(divScore),
+      paragraph_variation: Math.round(paraScore),
     },
     sentence_count: sentences.length,
-    sentences_analyzed: results.length,
+    word_count: words.length,
     flagged_sentences: flaggedSentences,
     model_used: model,
   };
 }
 
-module.exports = { detect, splitSentences, calcPerplexity, calcBurstiness, computeScore };
+module.exports = { detect, splitSentences, tokenize, vocabRichness, calcBurstiness, countAIPatterns };
