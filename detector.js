@@ -9,37 +9,41 @@ const https = require('https');
 const TOKENIZE_MODEL = 'gpt-4o-mini'; // cheap, fast, has logprobs
 
 /**
- * Get per-token log probabilities from OpenAI
+ * Get predictability of a sentence given its context.
  * 
- * Approach: Ask the model to CONTINUE from a prefix of each sentence.
- * The logprobs on the continuation tell us how predictable the text is.
- * More predictable = lower perplexity = more likely AI-generated.
+ * Approach: Feed prior context + first half of sentence as a prompt.
+ * Ask the model to continue. Measure word overlap with actual second half.
+ * High overlap = model can predict this text = likely AI-generated.
  * 
- * We split text into sentences, feed each as a completion prompt,
- * and measure how "surprised" the model is.
+ * Context is key — AI text is predictable IN CONTEXT, not in isolation.
  */
-function getLogprobsForSentence(sentence, apiKey, model = TOKENIZE_MODEL) {
-  // Split sentence roughly in half — give first half as prompt, measure prediction of second half
+function predictSentence(sentence, priorContext, apiKey, model = TOKENIZE_MODEL) {
   const words = sentence.split(/\s+/);
-  if (words.length < 4) return Promise.resolve([]);
+  if (words.length < 4) return Promise.resolve({ predictability: 0, avgLogprob: -5 });
 
-  const splitPoint = Math.floor(words.length / 2);
+  // Give first 40% as prompt, predict the remaining 60%
+  const splitPoint = Math.max(2, Math.floor(words.length * 0.4));
   const prefix = words.slice(0, splitPoint).join(' ');
   const expected = words.slice(splitPoint).join(' ');
+  const expectedWordCount = words.length - splitPoint;
+
+  // Include up to 200 words of prior context for better prediction
+  const contextWords = priorContext.split(/\s+/).slice(-200).join(' ');
+  const fullPrompt = contextWords ? `${contextWords} ${prefix}` : prefix;
 
   const body = JSON.stringify({
     model,
     messages: [
       {
         role: 'system',
-        content: 'Continue the following text naturally. Write ONLY the next few words to complete the thought. Do not explain.'
+        content: 'Continue the following text naturally. Write exactly the next ' + expectedWordCount + ' words. Do not explain, do not add anything extra.'
       },
-      { role: 'user', content: prefix }
+      { role: 'user', content: fullPrompt }
     ],
-    max_tokens: Math.min(100, expected.length),
+    max_tokens: Math.min(150, expectedWordCount * 3),
     temperature: 0,
     logprobs: true,
-    top_logprobs: 5,
+    top_logprobs: 3,
   });
 
   return new Promise((resolve, reject) => {
@@ -65,28 +69,41 @@ function getLogprobsForSentence(sentence, apiKey, model = TOKENIZE_MODEL) {
           const content = parsed.choices?.[0]?.logprobs?.content || [];
           const completion = parsed.choices?.[0]?.message?.content || '';
 
-          // Measure similarity between expected continuation and actual completion
-          // Higher similarity + high confidence (low logprobs) = AI-like text
-          const expectedWords = expected.toLowerCase().split(/\s+/);
-          const completionWords = completion.toLowerCase().split(/\s+/);
+          // Word-level overlap (case-insensitive, punctuation-stripped)
+          const normalize = w => w.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const expectedArr = expected.split(/\s+/).map(normalize).filter(w => w.length > 0);
+          const completionArr = completion.split(/\s+/).map(normalize).filter(w => w.length > 0);
 
+          // Sliding window match — check if expected words appear in order in completion
           let matchCount = 0;
-          const checkLen = Math.min(expectedWords.length, completionWords.length);
-          for (let i = 0; i < checkLen; i++) {
-            // Fuzzy match — strip punctuation
-            const e = expectedWords[i].replace(/[^a-z0-9]/g, '');
-            const c = completionWords[i].replace(/[^a-z0-9]/g, '');
-            if (e === c) matchCount++;
+          let compIdx = 0;
+          for (const ew of expectedArr) {
+            // Look ahead up to 3 positions for a match (allows small insertions)
+            for (let look = 0; look < 3 && compIdx + look < completionArr.length; look++) {
+              if (completionArr[compIdx + look] === ew) {
+                matchCount++;
+                compIdx = compIdx + look + 1;
+                break;
+              }
+            }
           }
 
-          const predictability = checkLen > 0 ? matchCount / checkLen : 0;
+          const predictability = expectedArr.length > 0 ? matchCount / expectedArr.length : 0;
+
+          // Model confidence (how sure it was about its own output)
+          const avgLogprob = content.length > 0
+            ? content.reduce((s, t) => s + (t.logprob || 0), 0) / content.length
+            : -5;
+
+          // Combined: both predictability AND confidence matter
+          // If model predicts same words AND is confident, very likely AI
+          const confidence = Math.exp(avgLogprob); // 0-1
 
           resolve({
-            logprobs: content,
             predictability,
-            avgLogprob: content.length > 0
-              ? content.reduce((s, t) => s + (t.logprob || 0), 0) / content.length
-              : -5,
+            confidence,
+            combinedScore: predictability * 0.7 + confidence * 0.3,
+            avgLogprob,
           });
         } catch (e) {
           reject(new Error('Failed to parse logprobs response'));
@@ -205,35 +222,38 @@ async function detect(text, apiKey, options = {}) {
     }
   }
 
-  // Get predictability for each sampled sentence
+  // Get predictability for each sampled sentence WITH context
   const results = [];
   for (const s of sampled) {
+    // Build prior context from all sentences before this one
+    const priorContext = sentences.slice(0, s.index).join(' ');
     try {
-      const r = await getLogprobsForSentence(s.text, apiKey, model);
+      const r = await predictSentence(s.text, priorContext, apiKey, model);
       results.push({
         ...s,
         predictability: r.predictability,
+        confidence: r.confidence,
+        combinedScore: r.combinedScore,
         avgLogprob: r.avgLogprob,
-        perplexity: Math.exp(-r.avgLogprob),
       });
     } catch (e) {
-      // Skip failed sentences
-      results.push({ ...s, predictability: 0.5, avgLogprob: -3, perplexity: 20, error: e.message });
+      results.push({ ...s, predictability: 0.3, confidence: 0.5, combinedScore: 0.3, avgLogprob: -3, error: e.message });
     }
   }
 
-  // Average predictability across sentences
+  // Average scores across sentences
   const avgPredictability = results.reduce((s, r) => s + r.predictability, 0) / results.length;
-  const perplexities = results.map(r => r.perplexity);
-  const avgPerplexity = perplexities.reduce((a, b) => a + b, 0) / perplexities.length;
-  const perplexityBurstiness = calcPerplexityBurstiness(perplexities);
+  const avgCombined = results.reduce((s, r) => s + (r.combinedScore || 0), 0) / results.length;
+  const avgConfidence = results.reduce((s, r) => s + (r.confidence || 0), 0) / results.length;
+  const predictabilities = results.map(r => r.predictability);
+  const predictBurstiness = calcPerplexityBurstiness(predictabilities); // reuse variance calc
 
-  // Predictability-based score:
-  // High predictability (>0.6) = AI, Low predictability (<0.2) = human
+  // Combined score (predictability * confidence):
+  // High (>0.45) = AI, Low (<0.1) = human
   let predictScore;
-  if (avgPredictability >= 0.6) predictScore = 0;
-  else if (avgPredictability <= 0.15) predictScore = 100;
-  else predictScore = ((0.6 - avgPredictability) / 0.45) * 100;
+  if (avgCombined >= 0.45) predictScore = 0;
+  else if (avgCombined <= 0.08) predictScore = 100;
+  else predictScore = ((0.45 - avgCombined) / 0.37) * 100;
 
   // Length burstiness score
   let lengthScore;
@@ -241,11 +261,11 @@ async function detect(text, apiKey, options = {}) {
   else if (lengthBurstiness >= 0.8) lengthScore = 100;
   else lengthScore = ((lengthBurstiness - 0.1) / 0.7) * 100;
 
-  // Perplexity burstiness score
+  // Predictability burstiness score (varied predictability = more human)
   let pBurstScore;
-  if (perplexityBurstiness <= 0.15) pBurstScore = 0;
-  else if (perplexityBurstiness >= 0.7) pBurstScore = 100;
-  else pBurstScore = ((perplexityBurstiness - 0.15) / 0.55) * 100;
+  if (predictBurstiness <= 0.15) pBurstScore = 0;
+  else if (predictBurstiness >= 0.7) pBurstScore = 100;
+  else pBurstScore = ((predictBurstiness - 0.15) / 0.55) * 100;
 
   // Weighted: predictability matters most
   const humanScore = Math.round(
@@ -254,13 +274,14 @@ async function detect(text, apiKey, options = {}) {
     ))
   );
 
-  // Flag highly predictable sentences
+  // Flag highly predictable sentences (combined > 0.35)
   const flaggedSentences = results
-    .filter(r => r.predictability > 0.5)
+    .filter(r => (r.combinedScore || 0) > 0.35)
     .map(r => ({
       text: r.text,
       predictability: Math.round(r.predictability * 1000) / 1000,
-      perplexity: Math.round(r.perplexity * 100) / 100,
+      confidence: Math.round((r.confidence || 0) * 1000) / 1000,
+      combined: Math.round((r.combinedScore || 0) * 1000) / 1000,
       word_count: r.text.split(/\s+/).length,
     }));
 
@@ -270,9 +291,10 @@ async function detect(text, apiKey, options = {}) {
     human_probability: Math.round(humanScore / 100 * 1000) / 1000,
     metrics: {
       avg_predictability: Math.round(avgPredictability * 1000) / 1000,
-      avg_perplexity: Math.round(avgPerplexity * 100) / 100,
+      avg_confidence: Math.round(avgConfidence * 1000) / 1000,
+      avg_combined: Math.round(avgCombined * 1000) / 1000,
       length_burstiness: Math.round(lengthBurstiness * 1000) / 1000,
-      perplexity_burstiness: Math.round(perplexityBurstiness * 1000) / 1000,
+      predict_burstiness: Math.round(predictBurstiness * 1000) / 1000,
     },
     sentence_count: sentences.length,
     sentences_analyzed: results.length,
