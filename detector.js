@@ -10,34 +10,36 @@ const TOKENIZE_MODEL = 'gpt-4o-mini'; // cheap, fast, has logprobs
 
 /**
  * Get per-token log probabilities from OpenAI
+ * 
+ * Approach: Ask the model to CONTINUE from a prefix of each sentence.
+ * The logprobs on the continuation tell us how predictable the text is.
+ * More predictable = lower perplexity = more likely AI-generated.
+ * 
+ * We split text into sentences, feed each as a completion prompt,
+ * and measure how "surprised" the model is.
  */
-function getLogprobs(text, apiKey, model = TOKENIZE_MODEL) {
-  const body = JSON.stringify({
-    model,
-    messages: [{ role: 'user', content: text }],
-    max_tokens: 1, // we only care about the prompt logprobs
-    logprobs: true,
-    echo: false,
-  });
+function getLogprobsForSentence(sentence, apiKey, model = TOKENIZE_MODEL) {
+  // Split sentence roughly in half — give first half as prompt, measure prediction of second half
+  const words = sentence.split(/\s+/);
+  if (words.length < 4) return Promise.resolve([]);
 
-  // Use completions endpoint for logprobs on input tokens
-  // Chat completions only gives logprobs on OUTPUT tokens
-  // So we use the old completions API with a newer model that supports it
-  // Actually, let's use a different approach: ask the model to repeat the text
-  // and capture logprobs on the output
-  const repeatBody = JSON.stringify({
+  const splitPoint = Math.floor(words.length / 2);
+  const prefix = words.slice(0, splitPoint).join(' ');
+  const expected = words.slice(splitPoint).join(' ');
+
+  const body = JSON.stringify({
     model,
     messages: [
       {
         role: 'system',
-        content: 'Repeat the following text EXACTLY as given. Do not change a single word, space, or punctuation mark. Output ONLY the repeated text.'
+        content: 'Continue the following text naturally. Write ONLY the next few words to complete the thought. Do not explain.'
       },
-      { role: 'user', content: text }
+      { role: 'user', content: prefix }
     ],
-    max_tokens: Math.min(4096, Math.ceil(text.length / 2)),
+    max_tokens: Math.min(100, expected.length),
     temperature: 0,
     logprobs: true,
-    top_logprobs: 1,
+    top_logprobs: 5,
   });
 
   return new Promise((resolve, reject) => {
@@ -47,9 +49,9 @@ function getLogprobs(text, apiKey, model = TOKENIZE_MODEL) {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(repeatBody),
+        'Content-Length': Buffer.byteLength(body),
       },
-      timeout: 60000,
+      timeout: 30000,
     }, res => {
       let data = '';
       res.on('data', c => data += c);
@@ -61,7 +63,31 @@ function getLogprobs(text, apiKey, model = TOKENIZE_MODEL) {
         try {
           const parsed = JSON.parse(data);
           const content = parsed.choices?.[0]?.logprobs?.content || [];
-          resolve(content);
+          const completion = parsed.choices?.[0]?.message?.content || '';
+
+          // Measure similarity between expected continuation and actual completion
+          // Higher similarity + high confidence (low logprobs) = AI-like text
+          const expectedWords = expected.toLowerCase().split(/\s+/);
+          const completionWords = completion.toLowerCase().split(/\s+/);
+
+          let matchCount = 0;
+          const checkLen = Math.min(expectedWords.length, completionWords.length);
+          for (let i = 0; i < checkLen; i++) {
+            // Fuzzy match — strip punctuation
+            const e = expectedWords[i].replace(/[^a-z0-9]/g, '');
+            const c = completionWords[i].replace(/[^a-z0-9]/g, '');
+            if (e === c) matchCount++;
+          }
+
+          const predictability = checkLen > 0 ? matchCount / checkLen : 0;
+
+          resolve({
+            logprobs: content,
+            predictability,
+            avgLogprob: content.length > 0
+              ? content.reduce((s, t) => s + (t.logprob || 0), 0) / content.length
+              : -5,
+          });
         } catch (e) {
           reject(new Error('Failed to parse logprobs response'));
         }
@@ -69,7 +95,7 @@ function getLogprobs(text, apiKey, model = TOKENIZE_MODEL) {
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('Logprobs timeout')); });
-    req.write(repeatBody);
+    req.write(body);
     req.end();
   });
 }
@@ -154,70 +180,102 @@ function computeScore(perplexity, lengthBurstiness, perplexityBurstiness) {
 
 /**
  * Main detection function
- * Returns: { score: 0-100, perplexity, burstiness, details }
+ * Analyzes each sentence for predictability using OpenAI logprobs.
+ * Returns: { score: 0-100, metrics, flagged_sentences }
  * score: 0 = AI, 100 = human
  */
 async function detect(text, apiKey, options = {}) {
   const model = options.model || TOKENIZE_MODEL;
+  const sentences = splitSentences(text);
 
-  // Get logprobs for the full text
-  const logprobs = await getLogprobs(text, apiKey, model);
-
-  if (!logprobs.length) {
-    return { score: 50, error: 'No logprobs returned', details: {} };
+  if (sentences.length === 0) {
+    return { score: 50, error: 'No sentences found', details: {} };
   }
 
-  // Overall perplexity
-  const overallPerplexity = calcPerplexity(logprobs);
-
-  // Split into sentences for burstiness
-  const sentences = splitSentences(text);
   const sentenceLengths = sentences.map(s => s.split(/\s+/).length);
-
-  // Length burstiness
   const lengthBurstiness = calcBurstiness(sentenceLengths);
 
-  // Per-sentence perplexity (approximate by splitting logprobs by sentence boundaries)
-  // This is a rough approximation — we assign logprobs to sentences by token count
-  const sentencePerplexities = [];
-  let tokenIdx = 0;
-  for (const sentence of sentences) {
-    const approxTokens = Math.ceil(sentence.length / 4); // rough char-to-token ratio
-    const sentLogprobs = logprobs.slice(tokenIdx, tokenIdx + approxTokens);
-    if (sentLogprobs.length > 0) {
-      sentencePerplexities.push(calcPerplexity(sentLogprobs));
+  // Analyze a sample of sentences (max 15 to keep costs down)
+  const sampleSize = Math.min(sentences.length, 15);
+  const step = Math.max(1, Math.floor(sentences.length / sampleSize));
+  const sampled = [];
+  for (let i = 0; i < sentences.length && sampled.length < sampleSize; i += step) {
+    if (sentences[i].split(/\s+/).length >= 4) {
+      sampled.push({ text: sentences[i], index: i });
     }
-    tokenIdx += approxTokens;
   }
 
-  const perplexityBurstiness = calcPerplexityBurstiness(sentencePerplexities);
-
-  // Compute final score
-  const humanScore = computeScore(overallPerplexity, lengthBurstiness, perplexityBurstiness);
-
-  // Flag individual sentences that look AI-generated
-  const flaggedSentences = [];
-  for (let i = 0; i < sentences.length; i++) {
-    const pplx = sentencePerplexities[i];
-    if (pplx !== undefined && pplx < 15 && sentenceLengths[i] > 5) {
-      flaggedSentences.push({
-        text: sentences[i],
-        perplexity: Math.round(pplx * 100) / 100,
-        word_count: sentenceLengths[i],
+  // Get predictability for each sampled sentence
+  const results = [];
+  for (const s of sampled) {
+    try {
+      const r = await getLogprobsForSentence(s.text, apiKey, model);
+      results.push({
+        ...s,
+        predictability: r.predictability,
+        avgLogprob: r.avgLogprob,
+        perplexity: Math.exp(-r.avgLogprob),
       });
+    } catch (e) {
+      // Skip failed sentences
+      results.push({ ...s, predictability: 0.5, avgLogprob: -3, perplexity: 20, error: e.message });
     }
   }
+
+  // Average predictability across sentences
+  const avgPredictability = results.reduce((s, r) => s + r.predictability, 0) / results.length;
+  const perplexities = results.map(r => r.perplexity);
+  const avgPerplexity = perplexities.reduce((a, b) => a + b, 0) / perplexities.length;
+  const perplexityBurstiness = calcPerplexityBurstiness(perplexities);
+
+  // Predictability-based score:
+  // High predictability (>0.6) = AI, Low predictability (<0.2) = human
+  let predictScore;
+  if (avgPredictability >= 0.6) predictScore = 0;
+  else if (avgPredictability <= 0.15) predictScore = 100;
+  else predictScore = ((0.6 - avgPredictability) / 0.45) * 100;
+
+  // Length burstiness score
+  let lengthScore;
+  if (lengthBurstiness <= 0.1) lengthScore = 0;
+  else if (lengthBurstiness >= 0.8) lengthScore = 100;
+  else lengthScore = ((lengthBurstiness - 0.1) / 0.7) * 100;
+
+  // Perplexity burstiness score
+  let pBurstScore;
+  if (perplexityBurstiness <= 0.15) pBurstScore = 0;
+  else if (perplexityBurstiness >= 0.7) pBurstScore = 100;
+  else pBurstScore = ((perplexityBurstiness - 0.15) / 0.55) * 100;
+
+  // Weighted: predictability matters most
+  const humanScore = Math.round(
+    Math.max(0, Math.min(100,
+      (predictScore * 0.5) + (lengthScore * 0.25) + (pBurstScore * 0.25)
+    ))
+  );
+
+  // Flag highly predictable sentences
+  const flaggedSentences = results
+    .filter(r => r.predictability > 0.5)
+    .map(r => ({
+      text: r.text,
+      predictability: Math.round(r.predictability * 1000) / 1000,
+      perplexity: Math.round(r.perplexity * 100) / 100,
+      word_count: r.text.split(/\s+/).length,
+    }));
 
   return {
-    score: humanScore, // 0 = AI, 100 = human
+    score: humanScore,
     ai_probability: Math.round((100 - humanScore) / 100 * 1000) / 1000,
     human_probability: Math.round(humanScore / 100 * 1000) / 1000,
     metrics: {
-      perplexity: Math.round(overallPerplexity * 100) / 100,
+      avg_predictability: Math.round(avgPredictability * 1000) / 1000,
+      avg_perplexity: Math.round(avgPerplexity * 100) / 100,
       length_burstiness: Math.round(lengthBurstiness * 1000) / 1000,
       perplexity_burstiness: Math.round(perplexityBurstiness * 1000) / 1000,
     },
     sentence_count: sentences.length,
+    sentences_analyzed: results.length,
     flagged_sentences: flaggedSentences,
     model_used: model,
   };
