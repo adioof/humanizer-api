@@ -38,6 +38,22 @@ Evaluate these signals (this is what frontier detectors measure):
    - Genuine opinion/emotion (not hedged corporate-speak)
    - Typos, self-corrections, parenthetical asides
 
+IMPORTANT: Be STRICT. Match the strictness of GPTZero (the industry standard). GPTZero flags even well-written AI text at 100% AI confidence. Your scoring should match:
+- Pure AI text (ChatGPT/Claude default output): score 0-15
+- AI text with light editing: score 15-30  
+- Heavily humanized AI text: score 30-50
+- Mix of human and AI: score 50-70
+- Genuine human writing (may still have some uniform patterns): score 70-85
+- Clearly human with strong personal voice: score 85-100
+
+Look for these AI giveaways even in "humanized" text:
+- Suspiciously smooth flow from point to point
+- Every paragraph roughly the same length
+- Lack of genuine personal experience or specific anecdotes
+- Perfect grammar throughout (humans make small errors)
+- Overly balanced "on one hand / on the other hand" structures
+- Generic analogies instead of oddly specific ones
+
 Respond with ONLY a JSON object (no markdown, no explanation):
 {
   "score": <0-100, where 0=definitely AI, 100=definitely human>,

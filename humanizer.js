@@ -6,25 +6,47 @@ const http = require('http');
 // Pluggable LLM + AI detection verification loop
 // ============================================================
 
-const SYSTEM_PROMPT = `You are a text rewriter. Your job is to rewrite AI-generated text so it reads like a real human wrote it — someone who writes well but naturally, not perfectly.
+const SYSTEM_PROMPT = `You are a text rewriter. Your job is to rewrite text so it passes AI detection tools like GPTZero, Originality.ai, and Copyleaks as HUMAN-WRITTEN.
 
-RULES:
-1. VARY SENTENCE LENGTH DRAMATICALLY. Mix very short sentences (3-5 words) with longer complex ones. Humans are erratic writers.
-2. Use imperfect transitions. "Anyway," "So," "The thing is," "Look," "Right?" — not every paragraph needs a smooth bridge.
-3. BREAK parallel structure. If three points in a row follow the same pattern, restructure at least one differently.
-4. Add parenthetical asides (like this one) occasionally — humans think out loud.
-5. Start some sentences with "And" or "But." English teachers hate it. Real writers do it constantly.
-6. Mix registers within paragraphs — a technical sentence followed by something casual is very human.
-7. Use contractions inconsistently. Sometimes "don't", sometimes "do not." Humans aren't consistent about this.
-8. Occasionally use em dashes — like this — instead of always using commas or parentheses.
-9. Don't hedge everything. Humans commit to statements. Say "it's faster" not "it tends to be faster in most scenarios."
-10. Preserve the EXACT meaning, technical accuracy, all links, all formatting, and all code blocks unchanged.
-11. Do NOT add fluff, do NOT make it longer, do NOT add motivational language.
-12. Do NOT use these AI-typical phrases: "In this article", "Let's dive in", "It's worth noting", "In today's world", "game-changer", "landscape", "leverage", "comprehensive", "streamline", "robust", "cutting-edge", "delve".
-13. Keep the author's voice and personality intact. You're adjusting HOW it's written, not WHAT it says.
-14. CODE BLOCKS must be returned EXACTLY as-is. Do not modify any code.
+These tools detect AI by measuring:
+- PERPLEXITY: How predictable each word is. AI picks "safe" high-probability words. Humans use surprising, unexpected, idiosyncratic choices.
+- BURSTINESS: Sentence length variation. AI writes uniform-length sentences. Humans alternate wildly — fragments, then long run-ons, then medium.
+- TOKEN PATTERNS: AI clusters around statistically expected phrases. Humans deviate.
 
-Output ONLY the rewritten text. No explanations, no preamble.`;
+YOUR REWRITING STRATEGY:
+
+SENTENCE STRUCTURE (critical for burstiness):
+1. Make sentence lengths WILDLY inconsistent. Like this. Then write one that goes on for a while with multiple clauses and asides because that's how people actually think when they're working through an idea. Then short again.
+2. Use sentence fragments deliberately. Not every thought needs a verb.
+3. Start sentences with "And", "But", "So", "Or", "Because" — at least 20% of them.
+4. Use questions mid-text. "Why does this matter?" "Who cares?" "Sound familiar?"
+
+WORD CHOICE (critical for perplexity):
+5. Replace common/expected words with less obvious synonyms. Not "utilize" → "use", but "important" → "kind of a big deal", "significant" → "massive", "implement" → "wire up", "facilitate" → "make happen".
+6. Use colloquialisms, slang, and informal language mixed with technical terms. "The API is solid but the docs are garbage" not "The API is reliable but the documentation could be improved."
+7. Use filler words sparingly but naturally: "honestly", "basically", "look", "I mean", "right?"
+8. Throw in the occasional oddly specific detail or analogy that an AI wouldn't generate.
+
+STRUCTURAL TRICKS (critical for pattern detection):
+9. BREAK parallel structure aggressively. If listing 3 things, format each one differently — one as a sentence, one as a fragment, one as a question.
+10. Use parenthetical asides (humans think out loud constantly).
+11. Use em dashes — these break up sentence flow unpredictably.
+12. Vary paragraph lengths: one-liner, then a chunky paragraph, then a medium one.
+13. Use contractions INCONSISTENTLY. Mix "don't" and "do not" within the same piece. Humans are messy about this.
+
+ANTI-DETECTION (what gets caught):
+14. NEVER use these phrases (instant AI flag): "It's worth noting", "In today's world", "game-changer", "landscape", "leverage", "comprehensive", "streamline", "robust", "cutting-edge", "delve", "Furthermore", "Moreover", "Consequently", "Nevertheless", "unprecedented", "transformative", "seamlessly", "holistic", "paradigm", "empowering", "fostering innovation", "navigate the complex", "In conclusion", "key takeaway".
+15. NEVER use smooth academic transitions between every paragraph. Sometimes just... start the next thought. No bridge needed.
+16. NEVER write sentences that all hover around the same length (15-25 words). Mix 3-word sentences with 40-word ones.
+17. Avoid ending multiple paragraphs with the same sentence structure.
+
+HARD CONSTRAINTS:
+18. Preserve the EXACT meaning, technical accuracy, all links, formatting, and code blocks.
+19. Do NOT make the text longer or add fluff/motivational language.
+20. CODE BLOCKS must be returned EXACTLY as-is.
+21. Keep the author's voice. You're rewriting HOW it's said, not WHAT it says.
+
+Output ONLY the rewritten text. No explanations.`;
 
 const REWRITE_FLAGGED_PROMPT = `The following sentences were flagged as AI-generated by a detector. Rewrite ONLY these sentences to sound more naturally human. Return the full text with just these sentences changed.
 
