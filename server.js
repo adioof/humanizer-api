@@ -137,13 +137,13 @@ route('POST', '/api/v1/humanize', async (req, res) => {
 
   // LLM config
   let llmApiKey = body.llm_api_key;
-  let llmProvider = body.llm_provider || 'openai';
-  let llmModel = body.llm_model || 'gpt-5.2';
+  let llmProvider = body.llm_provider || 'openrouter';
+  let llmModel = body.llm_model || 'anthropic/claude-opus-4-6';
   let llmBaseUrl = body.llm_base_url;
 
   if (!llmApiKey && useCredits && LLM_API_KEY) {
     llmApiKey = LLM_API_KEY;
-    llmProvider = 'openai';
+    llmProvider = 'openrouter';
   }
 
   if (!llmApiKey) {
@@ -215,7 +215,7 @@ route('POST', '/api/v1/detect', async (req, res) => {
   if (provider === 'inhouse') {
     const openaiKey = body.llm_api_key || body.openai_api_key || LLM_API_KEY;
     if (!openaiKey) return json(res, { error: 'llm_api_key or openai_api_key required for in-house detection' }, 400);
-    const result = await detectInHouse(body.text, openaiKey, { model: body.model || 'gpt-5.2' });
+    const result = await detectInHouse(body.text, openaiKey, { model: body.model || 'anthropic/claude-opus-4-6' });
     json(res, result);
     return;
   }

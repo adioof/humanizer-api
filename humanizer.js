@@ -64,12 +64,15 @@ Rewrite the flagged sentences to be less predictable — vary word choice, sente
 
 class LLMProvider {
   constructor(config) {
-    this.provider = config.provider || 'openai';
+    this.provider = config.provider || 'openrouter';
     this.apiKey = config.apiKey;
     this.model = config.model;
     this.baseUrl = config.baseUrl;
 
-    if (this.provider === 'openai') {
+    if (this.provider === 'openrouter') {
+      this.model = this.model || 'anthropic/claude-opus-4-6';
+      this.baseUrl = this.baseUrl || 'https://openrouter.ai/api';
+    } else if (this.provider === 'openai') {
       this.model = this.model || 'gpt-5.2';
       this.baseUrl = this.baseUrl || 'https://api.openai.com';
     } else if (this.provider === 'anthropic') {
@@ -185,7 +188,7 @@ class AIDetector {
   async _inhouse(text) {
     // Uses the in-house detector (OpenAI logprobs + perplexity/burstiness)
     const { detect } = require('./detector');
-    const result = await detect(text, this.apiKey, { model: this.model || 'gpt-5.2' });
+    const result = await detect(text, this.apiKey, { model: this.model || 'anthropic/claude-opus-4-6' });
     return {
       provider: 'inhouse',
       score: (100 - result.score) / 100, // convert: detector gives 0-100 human, we need 0-1 AI

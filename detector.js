@@ -128,7 +128,7 @@ function countAIPatterns(text) {
 /**
  * LLM-as-classifier: Ask GPT-4o-mini to score the text
  */
-function llmClassify(text, apiKey, model = 'gpt-5.2') {
+function llmClassify(text, apiKey, model = 'anthropic/claude-opus-4-6') {
   // Truncate to ~2000 words to keep costs low
   const truncated = text.split(/\s+/).slice(0, 2000).join(' ');
 
@@ -143,7 +143,7 @@ function llmClassify(text, apiKey, model = 'gpt-5.2') {
   });
 
   return new Promise((resolve, reject) => {
-    const url = new URL('https://api.openai.com/v1/chat/completions');
+    const url = new URL('https://openrouter.ai/api/v1/chat/completions');
     const req = https.request(url, {
       method: 'POST',
       headers: {
@@ -184,7 +184,7 @@ function llmClassify(text, apiKey, model = 'gpt-5.2') {
  * Combines LLM classification with statistical signals
  */
 async function detect(text, apiKey, options = {}) {
-  const model = options.model || 'gpt-5.2';
+  const model = options.model || 'anthropic/claude-opus-4-6';
   const sentences = splitSentences(text);
   const words = tokenize(text);
 
