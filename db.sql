@@ -71,6 +71,46 @@ create policy "Users see own payments" on payments for all using (auth.uid() = u
 create index idx_api_keys_hash on api_keys(key_hash) where active = true;
 create index idx_usage_log_user on usage_log(user_id, created_at desc);
 
+-- Atomic credit deduction (returns false if insufficient)
+create or replace function deduct_credits(p_user_id uuid, p_words integer)
+returns json as $$
+declare
+  new_balance integer;
+begin
+  update credits
+  set balance = balance - p_words, updated_at = now()
+  where user_id = p_user_id and balance >= p_words
+  returning balance into new_balance;
+
+  if not found then
+    return json_build_object('success', false, 'error', 'insufficient_credits');
+  end if;
+
+  return json_build_object('success', true, 'balance', new_balance);
+end;
+$$ language plpgsql security definer;
+
+-- Atomic credit addition
+create or replace function add_credits(p_user_id uuid, p_words integer)
+returns json as $$
+declare
+  new_balance integer;
+begin
+  update credits
+  set balance = balance + p_words, total_purchased = total_purchased + p_words, updated_at = now()
+  where user_id = p_user_id
+  returning balance into new_balance;
+
+  if not found then
+    -- Create row if missing (edge case)
+    insert into credits (user_id, balance, total_purchased) values (p_user_id, p_words, p_words)
+    returning balance into new_balance;
+  end if;
+
+  return json_build_object('success', true, 'balance', new_balance);
+end;
+$$ language plpgsql security definer;
+
 -- Auto-create credits row on signup
 create or replace function handle_new_user()
 returns trigger as $$
