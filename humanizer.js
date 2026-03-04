@@ -70,7 +70,7 @@ class LLMProvider {
     this.baseUrl = config.baseUrl;
 
     if (this.provider === 'openai') {
-      this.model = this.model || 'gpt-4o-mini';
+      this.model = this.model || 'gpt-5.2';
       this.baseUrl = this.baseUrl || 'https://api.openai.com';
     } else if (this.provider === 'anthropic') {
       this.model = this.model || 'claude-sonnet-4-20250514';
@@ -185,7 +185,7 @@ class AIDetector {
   async _inhouse(text) {
     // Uses the in-house detector (OpenAI logprobs + perplexity/burstiness)
     const { detect } = require('./detector');
-    const result = await detect(text, this.apiKey, { model: this.model || 'gpt-4o-mini' });
+    const result = await detect(text, this.apiKey, { model: this.model || 'gpt-5.2' });
     return {
       provider: 'inhouse',
       score: (100 - result.score) / 100, // convert: detector gives 0-100 human, we need 0-1 AI

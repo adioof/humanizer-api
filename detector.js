@@ -128,7 +128,7 @@ function countAIPatterns(text) {
 /**
  * LLM-as-classifier: Ask GPT-4o-mini to score the text
  */
-function llmClassify(text, apiKey, model = 'gpt-4o-mini') {
+function llmClassify(text, apiKey, model = 'gpt-5.2') {
   // Truncate to ~2000 words to keep costs low
   const truncated = text.split(/\s+/).slice(0, 2000).join(' ');
 
@@ -184,7 +184,7 @@ function llmClassify(text, apiKey, model = 'gpt-4o-mini') {
  * Combines LLM classification with statistical signals
  */
 async function detect(text, apiKey, options = {}) {
-  const model = options.model || 'gpt-4o-mini';
+  const model = options.model || 'gpt-5.2';
   const sentences = splitSentences(text);
   const words = tokenize(text);
 
