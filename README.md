@@ -17,16 +17,16 @@ LLM-powered AI text humanizer with detection verification loop. Bring your own L
 ```json
 {
   "text": "Your AI-generated text here...",
-  "llm_provider": "openai",
-  "llm_api_key": "sk-...",
-  "llm_model": "gpt-4o-mini",
+  "llm_provider": "openrouter",
+  "llm_api_key": "sk-or-...",
+  "llm_model": "anthropic/claude-opus-4-6",
   "detector_api_key": "gptzero-key (optional)",
   "max_retries": 2,
   "target_score": 0.3
 }
 ```
 
-**LLM Providers:** `openai`, `anthropic`, `custom` (any OpenAI-compatible endpoint via `llm_base_url`)
+**LLM Providers:** `openrouter` (default), `openai`, `anthropic`, `custom` (any OpenAI-compatible endpoint via `llm_base_url`)
 
 **Response:**
 ```json
