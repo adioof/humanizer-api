@@ -95,14 +95,20 @@ function predictSentence(sentence, priorContext, apiKey, model = TOKENIZE_MODEL)
             ? content.reduce((s, t) => s + (t.logprob || 0), 0) / content.length
             : -5;
 
-          // Combined: both predictability AND confidence matter
-          // If model predicts same words AND is confident, very likely AI
+          // Confidence = how sure the model was about its own output
           const confidence = Math.exp(avgLogprob); // 0-1
+
+          // Combined: predictability is the primary signal
+          // Confidence only boosts when predictability is already moderate+
+          // This prevents high-confidence-but-wrong completions from inflating scores
+          const combinedScore = predictability >= 0.15
+            ? predictability * 0.85 + confidence * 0.15
+            : predictability;
 
           resolve({
             predictability,
             confidence,
-            combinedScore: predictability * 0.7 + confidence * 0.3,
+            combinedScore,
             avgLogprob,
           });
         } catch (e) {
@@ -248,12 +254,12 @@ async function detect(text, apiKey, options = {}) {
   const predictabilities = results.map(r => r.predictability);
   const predictBurstiness = calcPerplexityBurstiness(predictabilities); // reuse variance calc
 
-  // Combined score (predictability * confidence):
-  // High (>0.45) = AI, Low (<0.1) = human
+  // Combined score:
+  // High (>0.4) = AI, Low (<0.05) = human
   let predictScore;
-  if (avgCombined >= 0.45) predictScore = 0;
-  else if (avgCombined <= 0.08) predictScore = 100;
-  else predictScore = ((0.45 - avgCombined) / 0.37) * 100;
+  if (avgCombined >= 0.4) predictScore = 0;
+  else if (avgCombined <= 0.05) predictScore = 100;
+  else predictScore = ((0.4 - avgCombined) / 0.35) * 100;
 
   // Length burstiness score
   let lengthScore;
@@ -274,9 +280,9 @@ async function detect(text, apiKey, options = {}) {
     ))
   );
 
-  // Flag highly predictable sentences (combined > 0.35)
+  // Flag highly predictable sentences (combined > 0.4)
   const flaggedSentences = results
-    .filter(r => (r.combinedScore || 0) > 0.35)
+    .filter(r => (r.combinedScore || 0) > 0.4)
     .map(r => ({
       text: r.text,
       predictability: Math.round(r.predictability * 1000) / 1000,
