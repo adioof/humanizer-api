@@ -326,13 +326,8 @@ function chunkText(text, maxChunk = 3000) {
 }
 
 // ============================================================
-// PIECE-LEVEL DETECTION & REWRITING
-// Break text into paragraphs, score each, only rewrite failures
+// HF SCORING HELPER
 // ============================================================
-
-function splitParagraphs(text) {
-  return text.split(/\n\n+/).map(p => p.trim()).filter(p => p.length > 0);
-}
 
 async function hfScore(text, hfToken) {
   const { detect } = require('./detector');
@@ -342,7 +337,8 @@ async function hfScore(text, hfToken) {
 
 // ============================================================
 // MAIN HUMANIZE FUNCTION
-// Break → Score → Rewrite failures → Reassemble → Re-score → Repeat
+// Full-text rewrite → Score → Rewrite again → Score → Repeat until 98%+
+// Keep the BEST scoring version across all attempts
 // ============================================================
 
 async function humanize(text, options = {}) {
@@ -370,15 +366,16 @@ async function humanize(text, options = {}) {
       continue;
     }
 
-    log.push({ chunk: ci + 1, type: 'prose', chars: chunk.text.length });
+    const originalText = chunk.text;
+    log.push({ chunk: ci + 1, type: 'prose', chars: originalText.length });
 
     // Step 1: Initial full rewrite
     let humanized;
     try {
-      humanized = await llm.complete(SYSTEM_PROMPT, chunk.text);
+      humanized = await llm.complete(SYSTEM_PROMPT, originalText);
     } catch (err) {
       log.push({ chunk: ci + 1, action: 'llm_error', error: err.message });
-      results.push(chunk.text);
+      results.push(originalText);
       continue;
     }
     log.push({ chunk: ci + 1, action: 'initial_rewrite', output_chars: humanized.length });
@@ -389,134 +386,75 @@ async function humanize(text, options = {}) {
       continue;
     }
 
-    // Step 2: Score full text first
-    let fullScore;
-    try {
-      fullScore = await hfScore(humanized, hfToken);
-    } catch (e) {
-      log.push({ chunk: ci + 1, action: 'detection_error', error: e.message });
-      results.push(humanized);
-      continue;
-    }
+    // Track the best version we've seen
+    let bestText = humanized;
+    let bestScore = 0;
 
-    log.push({ chunk: ci + 1, round: 0, full_human: Math.round(fullScore.human * 1000) / 1000 });
-
-    if (fullScore.human >= targetHuman) {
-      log.push({ chunk: ci + 1, action: 'passed_first_try', human: fullScore.human });
-      results.push(humanized);
-      continue;
-    }
-
-    // Step 3: Break into paragraphs, score each
-    for (let round = 1; round <= maxRounds; round++) {
-      const paragraphs = splitParagraphs(humanized);
-      const scored = [];
-
-      for (let pi = 0; pi < paragraphs.length; pi++) {
-        const p = paragraphs[pi];
-        if (p.length < 30) {
-          scored.push({ idx: pi, text: p, human: 1, ai: 0, pass: true });
-          continue;
-        }
-        try {
-          const s = await hfScore(p, hfToken);
-          scored.push({ idx: pi, text: p, human: s.human, ai: s.ai, pass: s.human >= 0.85 });
-        } catch (e) {
-          scored.push({ idx: pi, text: p, human: 0.5, ai: 0.5, pass: true }); // skip on error
-        }
-      }
-
-      const failing = scored.filter(s => !s.pass).sort((a, b) => a.human - b.human);
-      log.push({
-        chunk: ci + 1,
-        round,
-        paragraphs: paragraphs.length,
-        failing: failing.length,
-        scores: scored.map(s => ({ human: Math.round(s.human * 100), pass: s.pass })),
-      });
-
-      if (failing.length === 0) {
-        // All paragraphs pass individually — check full text
-        const reassembled = scored.map(s => s.text).join('\n\n');
-        const fs = await hfScore(reassembled, hfToken);
-        log.push({ chunk: ci + 1, round, full_human: Math.round(fs.human * 1000) / 1000 });
-
-        if (fs.human >= targetHuman) {
-          humanized = reassembled;
-          log.push({ chunk: ci + 1, action: 'passed', human: fs.human });
-          break;
-        }
-
-        // Full text fails but paragraphs pass — need structural diversity
-        if (round <= maxRounds - 1) {
-          try {
-            humanized = await llm.complete(
-              SYSTEM_PROMPT,
-              `This text scores ${Math.round(fs.human * 100)}% human. Individual paragraphs pass but the overall text reads as AI because paragraphs share similar rhythm and structure. Rephrase to vary the pacing between paragraphs — some short, some long, different sentence openings. KEEP THE EXACT SAME MEANING AND POINTS. Do NOT add or remove content.
-
-Text:\n\n${reassembled}`,
-              0.95
-            );
-            log.push({ chunk: ci + 1, action: 'structural_diversity_rewrite' });
-          } catch (e) {
-            log.push({ chunk: ci + 1, action: 'rewrite_error', error: e.message });
-            break;
-          }
-        }
-        continue;
-      }
-
-      // Rewrite only the failing paragraphs
-      const newParagraphs = [...paragraphs];
-      for (const fail of failing) {
-        const temp = Math.min(0.9 + (round * 0.02), 1.0);
-        try {
-          let rewritePrompt;
-          const MEANING_CONSTRAINT = `CRITICAL: Keep the EXACT same meaning, facts, points, and information. Do NOT add new ideas, tangents, or opinions. Do NOT remove any points. Same message, different words and rhythm. If the original says "React Server Components reduce bundle size" the rewrite MUST say the same thing — just phrased differently.`;
-
-          if (round <= 3) {
-            rewritePrompt = `This paragraph scores ${Math.round(fail.human * 100)}% human (needs 85%+). Rewrite with different word choices and sentence rhythm. ${MEANING_CONSTRAINT}
-
-Techniques: swap synonyms, split or merge sentences, reorder clauses within a sentence, vary sentence lengths, swap formal for casual phrasing or vice versa.
-
-Paragraph to rewrite:
-${fail.text}`;
-          } else if (round <= 7) {
-            rewritePrompt = `Rewrite this paragraph with completely different sentence structures and word choices. ${MEANING_CONSTRAINT}
-
-Every sentence must convey the same point as the original but use different vocabulary and pacing. Mix short and long sentences.
-
-${fail.text}`;
-          } else {
-            rewritePrompt = `Rephrase this paragraph one more time. Different words, different rhythm, same exact content. ${MEANING_CONSTRAINT}
-
-${fail.text}`;
-          }
-          const rewritten = await llm.complete(SYSTEM_PROMPT, rewritePrompt, temp);
-          newParagraphs[fail.idx] = rewritten.trim();
-          log.push({ chunk: ci + 1, round, para: fail.idx, action: 'rewrite', from_human: Math.round(fail.human * 100) });
-        } catch (e) {
-          log.push({ chunk: ci + 1, round, para: fail.idx, action: 'rewrite_error', error: e.message });
-        }
-      }
-
-      // Reassemble and score full text
-      humanized = newParagraphs.join('\n\n');
+    // Step 2: Score → Rewrite → Score loop
+    for (let round = 0; round < maxRounds; round++) {
+      let score;
       try {
-        fullScore = await hfScore(humanized, hfToken);
-        log.push({ chunk: ci + 1, round, full_human: Math.round(fullScore.human * 1000) / 1000 });
+        score = await hfScore(humanized, hfToken);
       } catch (e) {
-        log.push({ chunk: ci + 1, round, action: 'full_score_error', error: e.message });
-        continue;
-      }
-
-      if (fullScore.human >= targetHuman) {
-        log.push({ chunk: ci + 1, action: 'passed', human: fullScore.human });
+        log.push({ chunk: ci + 1, round, action: 'score_error', error: e.message });
         break;
       }
 
-      if (round === maxRounds) {
-        log.push({ chunk: ci + 1, action: 'max_rounds', final_human: fullScore.human });
+      const humanPct = Math.round(score.human * 1000) / 1000;
+      log.push({ chunk: ci + 1, round, human: humanPct });
+
+      // Track best
+      if (score.human > bestScore) {
+        bestScore = score.human;
+        bestText = humanized;
+      }
+
+      // Target met
+      if (score.human >= targetHuman) {
+        log.push({ chunk: ci + 1, action: 'passed', human: score.human, round });
+        break;
+      }
+
+      // Last round — use best we found
+      if (round === maxRounds - 1) {
+        log.push({ chunk: ci + 1, action: 'max_rounds', best_human: bestScore, round });
+        humanized = bestText;
+        break;
+      }
+
+      // Step 3: Full-text rewrite with escalating strategies
+      const temp = Math.min(0.85 + (round * 0.02), 1.0);
+      try {
+        if (round < 3) {
+          // Strategy A: Rephrase the current output
+          humanized = await llm.complete(
+            SYSTEM_PROMPT,
+            `This text scored ${Math.round(score.human * 100)}% human (need 98%+). Rephrase it — same meaning, different words and sentence structures throughout. Every sentence needs different vocabulary and rhythm from the current version.\n\n${humanized}`,
+            temp
+          );
+          log.push({ chunk: ci + 1, action: 'rephrase', round });
+
+        } else if (round < 6) {
+          // Strategy B: Rewrite from the ORIGINAL input (fresh start)
+          humanized = await llm.complete(
+            SYSTEM_PROMPT,
+            `Rephrase this text completely. Same facts and meaning, but use entirely different sentence structures and word choices from any previous version. Mix very short sentences (3-5 words) with longer ones (25-35 words). Avoid any uniform patterns.\n\n${originalText}`,
+            temp
+          );
+          log.push({ chunk: ci + 1, action: 'fresh_rewrite', round });
+
+        } else {
+          // Strategy C: Rewrite from original with different system approach
+          humanized = await llm.complete(
+            'Rephrase the following text. Use the same meaning and facts but completely different wording. Vary sentence lengths between very short (under 6 words) and medium-long (20-30 words). Use casual phrasing mixed with technical terms. No smooth transitions between ideas. Output ONLY the rephrased text.',
+            originalText,
+            temp
+          );
+          log.push({ chunk: ci + 1, action: 'alt_system_rewrite', round });
+        }
+      } catch (err) {
+        log.push({ chunk: ci + 1, action: 'rewrite_error', error: err.message, round });
+        break;
       }
     }
 
