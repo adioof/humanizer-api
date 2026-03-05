@@ -6,61 +6,48 @@ const http = require('http');
 // Pluggable LLM + AI detection verification loop
 // ============================================================
 
-const SYSTEM_PROMPT = `You are a text rewriter. Your job is to rewrite text so it passes AI detection tools like GPTZero, Originality.ai, and Copyleaks as HUMAN-WRITTEN.
+const SYSTEM_PROMPT = `You are a text rewriter. Your ONLY job is to rephrase text using different words and sentence structures while keeping the EXACT same meaning.
 
-These tools detect AI by measuring:
-- PERPLEXITY: How predictable each word is. AI picks "safe" high-probability words. Humans use surprising, unexpected, idiosyncratic choices.
-- BURSTINESS: Sentence length variation. AI writes uniform-length sentences. Humans alternate wildly — fragments, then long run-ons, then medium.
-- TOKEN PATTERNS: AI clusters around statistically expected phrases. Humans deviate.
+ABSOLUTE RULE — MEANING PRESERVATION:
+- Every fact, point, claim, number, name, and piece of information in the original MUST appear in your output.
+- Do NOT add new ideas, opinions, tangents, examples, or analogies that weren't in the original.
+- Do NOT remove any points or information.
+- Do NOT change the meaning of anything. If the original says "React Server Components reduce bundle size", your output must say the same thing — just phrased differently.
+- Same message. Different words. That is the entire job.
 
-YOUR REWRITING STRATEGY:
+HOW TO REPHRASE (to pass AI detection):
 
-SENTENCE STRUCTURE (critical for burstiness):
-1. Make sentence lengths WILDLY inconsistent. Like this. Then write one that goes on for a while with multiple clauses and asides because that's how people actually think when they're working through an idea. Then short again.
-2. Use sentence fragments deliberately. Not every thought needs a verb.
-3. Start sentences with "And", "But", "So", "Or", "Because" — at least 20% of them.
-4. Use questions mid-text. "Why does this matter?" "Who cares?" "Sound familiar?"
+SENTENCE STRUCTURE:
+1. Vary sentence lengths. Short ones. Then longer ones that go on for a bit with clauses and asides. Then short again.
+2. Use fragments occasionally.
+3. Start some sentences with "And", "But", "So", "Because".
+4. Drop in a rhetorical question here and there.
 
-WORD CHOICE (critical for perplexity):
-5. Replace common/expected words with less obvious synonyms. Not "utilize" → "use", but "important" → "kind of a big deal", "significant" → "massive", "implement" → "wire up", "facilitate" → "make happen".
-6. Use colloquialisms, slang, and informal language mixed with technical terms. "The API is solid but the docs are garbage" not "The API is reliable but the documentation could be improved."
-7. Use filler words sparingly but naturally: "honestly", "basically", "look", "I mean", "right?"
-8. Throw in the occasional oddly specific detail or analogy that an AI wouldn't generate.
+WORD CHOICE:
+5. Swap words for less predictable synonyms — "important" → "kind of a big deal", "implement" → "wire up".
+6. Mix casual and technical language naturally.
+7. Occasional filler: "honestly", "basically", "look".
+8. Use contractions inconsistently — mix "don't" and "do not".
 
-STRUCTURAL TRICKS (critical for pattern detection):
-9. BREAK parallel structure aggressively. If listing 3 things, format each one differently — one as a sentence, one as a fragment, one as a question.
-10. Use parenthetical asides (humans think out loud constantly).
-11. Use em dashes — these break up sentence flow unpredictably.
-12. Vary paragraph lengths: one-liner, then a chunky paragraph, then a medium one.
-13. Use contractions INCONSISTENTLY. Mix "don't" and "do not" within the same piece. Humans are messy about this.
-
-ANTI-DETECTION (what gets caught):
-14. NEVER use these phrases (instant AI flag): "It's worth noting", "In today's world", "game-changer", "landscape", "leverage", "comprehensive", "streamline", "robust", "cutting-edge", "delve", "Furthermore", "Moreover", "Consequently", "Nevertheless", "unprecedented", "transformative", "seamlessly", "holistic", "paradigm", "empowering", "fostering innovation", "navigate the complex", "In conclusion", "key takeaway".
-15. NEVER use smooth academic transitions between every paragraph. Sometimes just... start the next thought. No bridge needed.
-16. NEVER write sentences that all hover around the same length (15-25 words). Mix 3-word sentences with 40-word ones.
-17. Avoid ending multiple paragraphs with the same sentence structure.
-
-HARD CONSTRAINTS:
-18. Preserve the EXACT meaning, technical accuracy, all links, formatting, and code blocks.
-19. Do NOT make the text longer or add fluff/motivational language.
-20. CODE BLOCKS must be returned EXACTLY as-is.
-21. Keep the author's voice. You're rewriting HOW it's said, not WHAT it says.
+WHAT NOT TO DO:
+9. NEVER use: "It's worth noting", "In today's world", "game-changer", "landscape", "leverage", "comprehensive", "streamline", "robust", "cutting-edge", "delve", "Furthermore", "Moreover", "Consequently", "Nevertheless", "unprecedented", "transformative", "seamlessly", "holistic", "paradigm", "empowering", "fostering innovation", "In conclusion", "key takeaway".
+10. NEVER use smooth academic transitions between every paragraph.
+11. NEVER write sentences that all hover around the same length.
+12. NEVER make the text longer or add fluff.
+13. CODE BLOCKS must be returned EXACTLY as-is.
 
 Output ONLY the rewritten text. No explanations.`;
 
-const REWRITE_FLAGGED_PROMPT = `The following sentences were flagged as AI-generated by a RoBERTa classifier. This classifier detects statistical patterns in word choice and sentence structure that are typical of LLM output.
+const REWRITE_FLAGGED_PROMPT = `The following sentences were flagged as AI-generated by a classifier.
 
-To pass detection, the rewritten sentences MUST:
-- Use unexpected, low-probability word choices (not the "obvious" next word)
-- Have irregular rhythm — mix a 4-word fragment with a 30-word run-on
-- Include at least one imperfection: a dash used loosely, a parenthetical aside, a casual "honestly" or "look"
-- Avoid smooth logical connectors (no "Furthermore", "Additionally", "This means that")
-- NOT start with "So here's the thing" or "Look," or any other single repeated opener
+Rewrite ONLY the flagged sentences. Keep everything else IDENTICAL word for word.
 
-Examples of sentences that PASS detection:
-- "Deleted like 4000 files off my phone yesterday. Chaotically. No regrets."
-- "The API is solid but honestly the docs are hot garbage and I spent 3 hours on something that should've taken 20 minutes."
-- "I know everyone says microservices are the answer but — and maybe this is controversial — a monolith would've shipped this thing in half the time."
+Rules for rewriting flagged sentences:
+- SAME exact meaning and information — just different words and sentence structure.
+- Use less predictable word choices.
+- Vary sentence length — mix short fragments with longer sentences.
+- No smooth connectors ("Furthermore", "Additionally").
+- Do NOT add new information, opinions, or tangents.
 
 Flagged sentences:
 {flagged}
@@ -68,7 +55,7 @@ Flagged sentences:
 Full text:
 {text}
 
-Rewrite ONLY the flagged sentences using the style guidance above. Keep everything else identical. Output the full text.`;
+Output the full text with ONLY the flagged sentences rephrased. Everything else unchanged.`;
 
 // ============================================================
 // LLM PROVIDERS
