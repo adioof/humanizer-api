@@ -390,67 +390,71 @@ async function humanize(text, options = {}) {
     let bestText = humanized;
     let bestScore = 0;
 
-    // Step 2: Score → Rewrite → Score loop
+    // Step 2: Score initial → Rewrite loop
+    // Score initial version
+    try {
+      const initScore = await hfScore(humanized, hfToken);
+      log.push({ chunk: ci + 1, round: 'init', human: Math.round(initScore.human * 1000) / 1000 });
+      if (initScore.human > bestScore) { bestScore = initScore.human; bestText = humanized; }
+      if (initScore.human >= targetHuman) {
+        log.push({ chunk: ci + 1, action: 'passed', human: initScore.human, round: 0 });
+        results.push(humanized);
+        continue;
+      }
+    } catch (e) {
+      log.push({ chunk: ci + 1, action: 'init_score_error', error: e.message });
+    }
+
     for (let round = 0; round < maxRounds; round++) {
-      let score;
-      try {
-        score = await hfScore(humanized, hfToken);
-      } catch (e) {
-        log.push({ chunk: ci + 1, round, action: 'score_error', error: e.message });
-        break;
-      }
-
-      const humanPct = Math.round(score.human * 1000) / 1000;
-      log.push({ chunk: ci + 1, round, human: humanPct });
-
-      // Track best
-      if (score.human > bestScore) {
-        bestScore = score.human;
-        bestText = humanized;
-      }
-
-      // Target met
-      if (score.human >= targetHuman) {
-        log.push({ chunk: ci + 1, action: 'passed', human: score.human, round });
-        break;
-      }
-
       // Last round — use best we found
       if (round === maxRounds - 1) {
-        log.push({ chunk: ci + 1, action: 'max_rounds', best_human: bestScore, round });
+        log.push({ chunk: ci + 1, action: 'max_rounds', best_human: Math.round(bestScore * 100), round });
         humanized = bestText;
         break;
       }
 
-      // Step 3: Full-text rewrite with escalating strategies
+      // Step 3: Generate multiple candidates, score each, keep best
       const temp = Math.min(0.85 + (round * 0.02), 1.0);
+      const source = round % 2 === 0 ? originalText : bestText; // alternate between fresh start and improving best
+      const prompt = round < 5
+        ? `Rephrase this text. Same meaning and facts, different words and sentence structures. Mix short sentences with longer ones. No AI-typical phrases.\n\n${source}`
+        : `Rewrite with completely different wording. Same facts. Vary rhythm — some very short sentences, some longer. Casual tone mixed with technical accuracy.\n\n${source}`;
+      const sys = round < 7 ? SYSTEM_PROMPT : 'Rephrase the following text using completely different words and sentence structures. Keep the exact same meaning and facts. Vary sentence lengths. Output ONLY the rephrased text.';
+
       try {
-        if (round < 3) {
-          // Strategy A: Rephrase the current output
-          humanized = await llm.complete(
-            SYSTEM_PROMPT,
-            `This text scored ${Math.round(score.human * 100)}% human (need 98%+). Rephrase it — same meaning, different words and sentence structures throughout. Every sentence needs different vocabulary and rhythm from the current version.\n\n${humanized}`,
-            temp
-          );
-          log.push({ chunk: ci + 1, action: 'rephrase', round });
+        // Generate 3 candidates in parallel, pick the best
+        const candidates = await Promise.all([
+          llm.complete(sys, prompt, temp).catch(() => null),
+          llm.complete(sys, prompt, Math.min(temp + 0.05, 1.0)).catch(() => null),
+          llm.complete(sys, prompt, Math.max(temp - 0.05, 0.7)).catch(() => null),
+        ]);
 
-        } else if (round < 6) {
-          // Strategy B: Rewrite from the ORIGINAL input (fresh start)
-          humanized = await llm.complete(
-            SYSTEM_PROMPT,
-            `Rephrase this text completely. Same facts and meaning, but use entirely different sentence structures and word choices from any previous version. Mix very short sentences (3-5 words) with longer ones (25-35 words). Avoid any uniform patterns.\n\n${originalText}`,
-            temp
-          );
-          log.push({ chunk: ci + 1, action: 'fresh_rewrite', round });
+        let roundBest = null;
+        let roundBestScore = 0;
+        for (const c of candidates) {
+          if (!c) continue;
+          try {
+            const s = await hfScore(c, hfToken);
+            if (s.human > roundBestScore) {
+              roundBestScore = s.human;
+              roundBest = c;
+            }
+          } catch (e) {}
+        }
 
+        if (roundBest) {
+          humanized = roundBest;
+          log.push({ chunk: ci + 1, action: 'best_of_3', round, score: Math.round(roundBestScore * 100) });
+          if (roundBestScore > bestScore) {
+            bestScore = roundBestScore;
+            bestText = roundBest;
+          }
+          if (roundBestScore >= targetHuman) {
+            log.push({ chunk: ci + 1, action: 'passed', human: roundBestScore, round });
+            break;
+          }
         } else {
-          // Strategy C: Rewrite from original with different system approach
-          humanized = await llm.complete(
-            'Rephrase the following text. Use the same meaning and facts but completely different wording. Vary sentence lengths between very short (under 6 words) and medium-long (20-30 words). Use casual phrasing mixed with technical terms. No smooth transitions between ideas. Output ONLY the rephrased text.',
-            originalText,
-            temp
-          );
-          log.push({ chunk: ci + 1, action: 'alt_system_rewrite', round });
+          log.push({ chunk: ci + 1, action: 'all_candidates_failed', round });
         }
       } catch (err) {
         log.push({ chunk: ci + 1, action: 'rewrite_error', error: err.message, round });
