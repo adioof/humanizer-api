@@ -13,6 +13,7 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const LLM_API_KEY = process.env.LLM_API_KEY;
 const GPTZERO_API_KEY = process.env.GPTZERO_API_KEY;
+const HF_TOKEN = process.env.HF_TOKEN;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim());
 const MAX_TEXT_LENGTH = parseInt(process.env.MAX_TEXT_LENGTH) || 50000;
 
@@ -209,13 +210,13 @@ route('POST', '/api/v1/detect', async (req, res) => {
   const body = parseJSON(rawBody);
   if (!body?.text) return json(res, { error: 'text is required' }, 400);
 
-  // In-house detection (default) — uses OpenAI logprobs, no third-party API needed
-  const provider = body.detector_provider || body.provider || 'inhouse';
+  // Default: HuggingFace RoBERTa classifier (free, accurate, no LLM cost)
+  const provider = body.detector_provider || body.provider || 'huggingface';
 
-  if (provider === 'inhouse') {
-    const openaiKey = body.llm_api_key || body.openai_api_key || LLM_API_KEY;
-    if (!openaiKey) return json(res, { error: 'llm_api_key or openai_api_key required for in-house detection' }, 400);
-    const result = await detectInHouse(body.text, openaiKey, { model: body.model || 'anthropic/claude-opus-4-6' });
+  if (provider === 'huggingface' || provider === 'inhouse') {
+    const hfToken = body.hf_token || HF_TOKEN;
+    if (!hfToken) return json(res, { error: 'hf_token or HF_TOKEN env var required for detection' }, 400);
+    const result = await detectInHouse(body.text, hfToken, { hf_token: hfToken });
     json(res, result);
     return;
   }
