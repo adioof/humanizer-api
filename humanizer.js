@@ -465,12 +465,7 @@ async function humanize(text, options = {}) {
           try {
             humanized = await llm.complete(
               SYSTEM_PROMPT,
-              `This text scores ${Math.round(fs.human * 100)}% human. Individual paragraphs pass but the overall text still reads as AI because the paragraphs have similar rhythm and structure to each other. Fix this by making each paragraph DRASTICALLY different in style:
-- One paragraph should be very short (1-2 sentences)
-- One should be a long run-on thought
-- One should start with a question or exclamation
-- Mix formal and casual within the same piece
-- Add one unexpected aside or tangent
+              `This text scores ${Math.round(fs.human * 100)}% human. Individual paragraphs pass but the overall text reads as AI because paragraphs share similar rhythm and structure. Rephrase to vary the pacing between paragraphs — some short, some long, different sentence openings. KEEP THE EXACT SAME MEANING AND POINTS. Do NOT add or remove content.
 
 Text:\n\n${reassembled}`,
               0.95
@@ -490,21 +485,23 @@ Text:\n\n${reassembled}`,
         const temp = Math.min(0.9 + (round * 0.02), 1.0);
         try {
           let rewritePrompt;
-          if (round <= 3) {
-            rewritePrompt = `This paragraph scores ${Math.round(fail.human * 100)}% human (needs 85%+). Rewrite it to sound like a real person — messy rhythm, unexpected words, imperfections. Same meaning, different delivery. DO NOT use smooth transitions or uniform sentence lengths.
+          const MEANING_CONSTRAINT = `CRITICAL: Keep the EXACT same meaning, facts, points, and information. Do NOT add new ideas, tangents, or opinions. Do NOT remove any points. Same message, different words and rhythm. If the original says "React Server Components reduce bundle size" the rewrite MUST say the same thing — just phrased differently.`;
 
-Examples of paragraphs that score 95%+ human:
-- "Deleted like 4000 files off my phone yesterday. Chaotically. No regrets."
-- "The API is solid but the docs are hot garbage. Spent 3 hours on something that should've taken 20 minutes and I'm still kind of mad about it honestly."
+          if (round <= 3) {
+            rewritePrompt = `This paragraph scores ${Math.round(fail.human * 100)}% human (needs 85%+). Rewrite with different word choices and sentence rhythm. ${MEANING_CONSTRAINT}
+
+Techniques: swap synonyms, split or merge sentences, reorder clauses within a sentence, vary sentence lengths, swap formal for casual phrasing or vice versa.
 
 Paragraph to rewrite:
 ${fail.text}`;
           } else if (round <= 7) {
-            rewritePrompt = `COMPLETELY rewrite this paragraph from scratch. Same core idea, totally different words. Write it like a Slack message to a coworker — casual, fragmented, real. Score: ${Math.round(fail.human * 100)}% human (need 85%+).
+            rewritePrompt = `Rewrite this paragraph with completely different sentence structures and word choices. ${MEANING_CONSTRAINT}
+
+Every sentence must convey the same point as the original but use different vocabulary and pacing. Mix short and long sentences.
 
 ${fail.text}`;
           } else {
-            rewritePrompt = `Rewrite as stream of consciousness. Same idea. Messy. Fragments ok. Tangents ok. Make it feel TYPED not COMPOSED.
+            rewritePrompt = `Rephrase this paragraph one more time. Different words, different rhythm, same exact content. ${MEANING_CONSTRAINT}
 
 ${fail.text}`;
           }
