@@ -174,10 +174,11 @@ route('POST', '/api/v1/humanize', async (req, res) => {
     llm_api_key: llmApiKey,
     llm_model: llmModel,
     llm_base_url: llmBaseUrl,
+    hf_token: body.hf_token || HF_TOKEN,
     detector_provider: body.detector_provider,
     detector_api_key: body.detector_api_key || GPTZERO_API_KEY,
-    max_retries: body.max_retries,
-    target_score: body.target_score,
+    max_retries: body.max_retries ?? 4,
+    target_score: body.target_score ?? 0.98,
     max_chunk_size: body.max_chunk_size,
   });
   result.time_ms = Date.now() - startTime;

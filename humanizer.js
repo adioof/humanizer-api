@@ -327,29 +327,52 @@ function chunkText(text, maxChunk = 3000) {
 }
 
 // ============================================================
+// SENTENCE-LEVEL DETECTION
+// Classifies individual sentences to find which ones are flagged
+// ============================================================
+
+async function detectSentences(text, hfToken) {
+  const { detect } = require('./detector');
+  const sentences = text.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 20);
+
+  // First: check full text score
+  const fullResult = await detect(text, hfToken, { hf_token: hfToken });
+  if (fullResult.human_probability >= 0.98) {
+    return { passed: true, human_score: fullResult.human_probability, flagged: [], fullResult };
+  }
+
+  // If not passing, test individual sentences to find the weak ones
+  const flagged = [];
+  for (const sentence of sentences) {
+    try {
+      const r = await detect(sentence, hfToken, { hf_token: hfToken });
+      if (r.ai_probability > 0.4) { // sentence looks AI-ish
+        flagged.push({ text: sentence, ai_score: r.ai_probability, human_score: r.human_probability });
+      }
+    } catch (e) {
+      // Skip sentences that are too short for detection
+    }
+  }
+
+  return { passed: false, human_score: fullResult.human_probability, flagged, fullResult };
+}
+
+// ============================================================
 // MAIN HUMANIZE FUNCTION
+// With HuggingFace feedback loop for 98%+ human scores
 // ============================================================
 
 async function humanize(text, options = {}) {
   const llm = new LLMProvider({
-    provider: options.llm_provider || 'openai',
+    provider: options.llm_provider || 'openrouter',
     apiKey: options.llm_api_key,
     model: options.llm_model,
     baseUrl: options.llm_base_url,
   });
 
-  // Default to in-house detection if no third-party detector key provided
-  const detectorProvider = options.detector_provider || (options.detector_api_key ? 'gptzero' : 'inhouse');
-  const detectorKey = detectorProvider === 'inhouse' ? options.llm_api_key : options.detector_api_key;
-
-  const detector = new AIDetector({
-    provider: detectorProvider,
-    apiKey: detectorKey,
-    model: options.llm_model,
-  });
-
-  const maxRetries = options.max_retries ?? 2;
-  const targetScore = options.target_score ?? 0.3;
+  const hfToken = options.hf_token || process.env.HF_TOKEN;
+  const maxRetries = options.max_retries ?? 4;
+  const targetHumanScore = options.target_score ?? 0.98; // 98% human
 
   const chunks = chunkText(text, options.max_chunk_size || 3000);
   const results = [];
@@ -358,6 +381,7 @@ async function humanize(text, options = {}) {
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
 
+    // Pass through non-prose (code, tables)
     if (chunk.type !== 'prose') {
       results.push(chunk.text);
       log.push({ chunk: i + 1, type: chunk.type, action: 'passthrough' });
@@ -366,67 +390,78 @@ async function humanize(text, options = {}) {
 
     log.push({ chunk: i + 1, type: 'prose', chars: chunk.text.length });
 
-    // Step 1: Humanize
+    // Step 1: Initial rewrite
     let humanized;
     try {
       humanized = await llm.complete(SYSTEM_PROMPT, chunk.text);
     } catch (err) {
       log.push({ chunk: i + 1, action: 'llm_error', error: err.message });
-      results.push(chunk.text); // fallback to original
+      results.push(chunk.text);
       continue;
     }
-    log.push({ chunk: i + 1, action: 'rewrite', output_chars: humanized.length });
+    log.push({ chunk: i + 1, action: 'initial_rewrite', output_chars: humanized.length });
 
-    // Step 2: Detection loop
-    for (let retry = 0; retry <= maxRetries; retry++) {
-      let detection;
-      try {
-        detection = await detector.detect(humanized);
-      } catch (err) {
-        log.push({ chunk: i + 1, action: 'detection_error', error: err.message });
-        break;
-      }
-
-      if (detection.skipped) {
-        log.push({ chunk: i + 1, action: 'detection_skipped' });
-        break;
-      }
-
-      log.push({
-        chunk: i + 1,
-        retry,
-        ai_score: Math.round(detection.score * 1000) / 1000,
-        human_score: Math.round(detection.human_score * 1000) / 1000,
-        flagged_sentences: detection.sentences.length,
-      });
-
-      if (detection.score <= targetScore) {
-        log.push({ chunk: i + 1, action: 'passed' });
-        break;
-      }
-
-      if (retry === maxRetries) {
-        log.push({ chunk: i + 1, action: 'max_retries', final_score: detection.score });
-        break;
-      }
-
-      // Step 3: Targeted rewrite
-      try {
-        if (detection.sentences.length > 0) {
-          const flaggedList = detection.sentences.map(s => `- "${s.text}" (${(s.prob * 100).toFixed(0)}% AI)`).join('\n');
-          const prompt = REWRITE_FLAGGED_PROMPT
-            .replace('{flagged}', flaggedList)
-            .replace('{text}', humanized);
-          humanized = await llm.complete(SYSTEM_PROMPT, prompt, 0.9);
-          log.push({ chunk: i + 1, action: 'targeted_rewrite', flagged: detection.sentences.length });
-        } else {
-          humanized = await llm.complete(SYSTEM_PROMPT, 'Rewrite this to sound MORE human and less predictable. Be bolder with variation:\n\n' + humanized, 0.95);
-          log.push({ chunk: i + 1, action: 'full_rewrite' });
+    // Step 2: HuggingFace feedback loop
+    if (hfToken) {
+      for (let retry = 0; retry < maxRetries; retry++) {
+        let detection;
+        try {
+          detection = await detectSentences(humanized, hfToken);
+        } catch (err) {
+          log.push({ chunk: i + 1, retry, action: 'detection_error', error: err.message });
+          break;
         }
-      } catch (err) {
-        log.push({ chunk: i + 1, action: 'rewrite_error', error: err.message });
-        break;
+
+        log.push({
+          chunk: i + 1,
+          retry,
+          human_score: Math.round(detection.human_score * 1000) / 1000,
+          flagged_count: detection.flagged.length,
+          passed: detection.passed,
+        });
+
+        // Target met — we're done
+        if (detection.passed || detection.human_score >= targetHumanScore) {
+          log.push({ chunk: i + 1, action: 'passed', final_human_score: detection.human_score });
+          break;
+        }
+
+        // Max retries hit
+        if (retry === maxRetries - 1) {
+          log.push({ chunk: i + 1, action: 'max_retries', final_human_score: detection.human_score });
+          break;
+        }
+
+        // Step 3: Targeted rewrite of flagged sentences
+        try {
+          if (detection.flagged.length > 0) {
+            const flaggedList = detection.flagged
+              .sort((a, b) => b.ai_score - a.ai_score) // worst first
+              .slice(0, 5) // max 5 at a time
+              .map(s => `- "${s.text}" (${Math.round(s.ai_score * 100)}% AI)`)
+              .join('\n');
+
+            const prompt = REWRITE_FLAGGED_PROMPT
+              .replace('{flagged}', flaggedList)
+              .replace('{text}', humanized);
+            humanized = await llm.complete(SYSTEM_PROMPT, prompt, 0.9);
+            log.push({ chunk: i + 1, action: 'targeted_rewrite', flagged: detection.flagged.length });
+          } else {
+            // No individual sentences flagged but full text still reads AI — do a style pass
+            humanized = await llm.complete(
+              SYSTEM_PROMPT,
+              'The text below scores as AI-written overall even though individual sentences pass. Rewrite to add more personality, vary rhythm more aggressively, and break up any remaining uniform patterns:\n\n' + humanized,
+              0.95
+            );
+            log.push({ chunk: i + 1, action: 'style_rewrite' });
+          }
+        } catch (err) {
+          log.push({ chunk: i + 1, action: 'rewrite_error', error: err.message });
+          break;
+        }
       }
+    } else {
+      log.push({ chunk: i + 1, action: 'no_hf_token_skip_detection' });
     }
 
     results.push(humanized);
@@ -434,15 +469,16 @@ async function humanize(text, options = {}) {
 
   const output = results.join('\n\n');
 
-  // Final full-text detection
+  // Final full-text detection score
   let finalDetection = null;
-  if (options.detector_api_key) {
+  if (hfToken) {
     try {
-      const proseOnly = chunks.reduce((acc, chunk, i) => {
-        if (chunk.type === 'prose') acc += results[i] + '\n\n';
+      const { detect } = require('./detector');
+      const proseOnly = chunks.reduce((acc, chunk, idx) => {
+        if (chunk.type === 'prose') acc += results[idx] + '\n\n';
         return acc;
       }, '').trim();
-      finalDetection = await detector.detect(proseOnly);
+      finalDetection = await detect(proseOnly, hfToken, { hf_token: hfToken });
     } catch (e) {
       finalDetection = { error: e.message };
     }
