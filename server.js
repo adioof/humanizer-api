@@ -177,7 +177,7 @@ route('POST', '/api/v1/humanize', async (req, res) => {
     hf_token: body.hf_token || HF_TOKEN,
     detector_provider: body.detector_provider,
     detector_api_key: body.detector_api_key || GPTZERO_API_KEY,
-    max_retries: body.max_retries ?? 4,
+    max_retries: body.max_retries ?? 6,
     target_score: body.target_score ?? 0.98,
     max_chunk_size: body.max_chunk_size,
   });
