@@ -383,7 +383,7 @@ async function humanize(text, options = {}) {
   });
 
   const hfToken = options.hf_token || process.env.HF_TOKEN;
-  const maxRetries = options.max_retries ?? 6;
+  const maxRetries = options.max_retries ?? 12;
   const targetHumanScore = options.target_score ?? 0.98; // 98% human
 
   const chunks = chunkText(text, options.max_chunk_size || 3000);
@@ -444,28 +444,50 @@ async function humanize(text, options = {}) {
           break;
         }
 
-        // Step 3: Targeted rewrite of flagged sentences
+        // Step 3: Escalating rewrite strategies
         try {
+          const prevScore = detection.human_score;
+          
           if (detection.flagged.length > 0) {
+            // Strategy A: Targeted rewrite of flagged sentences
             const flaggedList = detection.flagged
-              .sort((a, b) => b.ai_score - a.ai_score) // worst first
-              .slice(0, 5) // max 5 at a time
+              .sort((a, b) => b.ai_score - a.ai_score)
+              .slice(0, 5)
               .map(s => `- "${s.text}" (${Math.round(s.ai_score * 100)}% AI)`)
               .join('\n');
 
             const prompt = REWRITE_FLAGGED_PROMPT
               .replace('{flagged}', flaggedList)
               .replace('{text}', humanized);
-            humanized = await llm.complete(SYSTEM_PROMPT, prompt, 0.9);
+            humanized = await llm.complete(SYSTEM_PROMPT, prompt, 0.9 + (retry * 0.015));
             log.push({ chunk: i + 1, action: 'targeted_rewrite', flagged: detection.flagged.length });
-          } else {
-            // No individual sentences flagged but full text still reads AI — do a style pass
+
+          } else if (retry < 4) {
+            // Strategy B: Style rewrite — add personality
             humanized = await llm.complete(
               SYSTEM_PROMPT,
-              'The text below scores as AI-written overall even though individual sentences pass. Rewrite to add more personality, vary rhythm more aggressively, and break up any remaining uniform patterns:\n\n' + humanized,
+              'This text scores ' + Math.round(detection.human_score * 100) + '% human but needs 98%+. The AI classifier detects uniform statistical patterns in the OVERALL text even though individual sentences pass. Make it messier — interrupt yourself mid-thought, add a random aside, use a run-on sentence, throw in something oddly specific. DO NOT add fluff or length. Just make the rhythm more chaotic and human:\n\n' + humanized,
               0.95
             );
             log.push({ chunk: i + 1, action: 'style_rewrite' });
+
+          } else if (retry < 8) {
+            // Strategy C: Nuclear — full rewrite from scratch using original input
+            humanized = await llm.complete(
+              SYSTEM_PROMPT,
+              'COMPLETELY rewrite this from scratch. Same meaning, totally different words and structure. Write it like you\'re explaining it to a friend over coffee — messy, casual, with tangents and personality. Temperature: chaotic. The previous version kept scoring as AI-generated, so you CANNOT reuse the same phrases or patterns:\n\n' + chunk.text,
+              0.98
+            );
+            log.push({ chunk: i + 1, action: 'nuclear_rewrite' });
+
+          } else {
+            // Strategy D: Last resort — rewrite as stream of consciousness
+            humanized = await llm.complete(
+              'You are rewriting text to sound like a real person\'s internal monologue typed out in a Slack message. Use sentence fragments. Start sentences with conjunctions. Include parenthetical asides. Make it feel unpolished and authentic. Vary sentence length between 3 words and 40 words. Output ONLY the rewritten text.',
+              'Rewrite this, same core ideas but totally unpolished human voice:\n\n' + chunk.text,
+              1.0
+            );
+            log.push({ chunk: i + 1, action: 'stream_of_consciousness_rewrite' });
           }
         } catch (err) {
           log.push({ chunk: i + 1, action: 'rewrite_error', error: err.message });
