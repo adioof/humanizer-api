@@ -339,39 +339,23 @@ function chunkText(text, maxChunk = 3000) {
 }
 
 // ============================================================
-// SENTENCE-LEVEL DETECTION
-// Classifies individual sentences to find which ones are flagged
+// PIECE-LEVEL DETECTION & REWRITING
+// Break text into paragraphs, score each, only rewrite failures
 // ============================================================
 
-async function detectSentences(text, hfToken) {
+function splitParagraphs(text) {
+  return text.split(/\n\n+/).map(p => p.trim()).filter(p => p.length > 0);
+}
+
+async function hfScore(text, hfToken) {
   const { detect } = require('./detector');
-  const sentences = text.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 20);
-
-  // First: check full text score
-  const fullResult = await detect(text, hfToken, { hf_token: hfToken });
-  if (fullResult.human_probability >= 0.98) {
-    return { passed: true, human_score: fullResult.human_probability, flagged: [], fullResult };
-  }
-
-  // If not passing, test individual sentences to find the weak ones
-  const flagged = [];
-  for (const sentence of sentences) {
-    try {
-      const r = await detect(sentence, hfToken, { hf_token: hfToken });
-      if (r.ai_probability > 0.4) { // sentence looks AI-ish
-        flagged.push({ text: sentence, ai_score: r.ai_probability, human_score: r.human_probability });
-      }
-    } catch (e) {
-      // Skip sentences that are too short for detection
-    }
-  }
-
-  return { passed: false, human_score: fullResult.human_probability, flagged, fullResult };
+  const r = await detect(text, hfToken, { hf_token: hfToken });
+  return { human: r.human_probability, ai: r.ai_probability, score: r.score };
 }
 
 // ============================================================
 // MAIN HUMANIZE FUNCTION
-// With HuggingFace feedback loop for 98%+ human scores
+// Break → Score → Rewrite failures → Reassemble → Re-score → Repeat
 // ============================================================
 
 async function humanize(text, options = {}) {
@@ -383,119 +367,173 @@ async function humanize(text, options = {}) {
   });
 
   const hfToken = options.hf_token || process.env.HF_TOKEN;
-  const maxRetries = options.max_retries ?? 12;
-  const targetHumanScore = options.target_score ?? 0.98; // 98% human
+  const maxRounds = options.max_retries ?? 10;
+  const targetHuman = options.target_score ?? 0.98;
 
   const chunks = chunkText(text, options.max_chunk_size || 3000);
   const results = [];
   const log = [];
 
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci];
 
-    // Pass through non-prose (code, tables)
     if (chunk.type !== 'prose') {
       results.push(chunk.text);
-      log.push({ chunk: i + 1, type: chunk.type, action: 'passthrough' });
+      log.push({ chunk: ci + 1, type: chunk.type, action: 'passthrough' });
       continue;
     }
 
-    log.push({ chunk: i + 1, type: 'prose', chars: chunk.text.length });
+    log.push({ chunk: ci + 1, type: 'prose', chars: chunk.text.length });
 
-    // Step 1: Initial rewrite
+    // Step 1: Initial full rewrite
     let humanized;
     try {
       humanized = await llm.complete(SYSTEM_PROMPT, chunk.text);
     } catch (err) {
-      log.push({ chunk: i + 1, action: 'llm_error', error: err.message });
+      log.push({ chunk: ci + 1, action: 'llm_error', error: err.message });
       results.push(chunk.text);
       continue;
     }
-    log.push({ chunk: i + 1, action: 'initial_rewrite', output_chars: humanized.length });
+    log.push({ chunk: ci + 1, action: 'initial_rewrite', output_chars: humanized.length });
 
-    // Step 2: HuggingFace feedback loop
-    if (hfToken) {
-      for (let retry = 0; retry < maxRetries; retry++) {
-        let detection;
+    if (!hfToken) {
+      log.push({ chunk: ci + 1, action: 'no_hf_token_skip_detection' });
+      results.push(humanized);
+      continue;
+    }
+
+    // Step 2: Score full text first
+    let fullScore;
+    try {
+      fullScore = await hfScore(humanized, hfToken);
+    } catch (e) {
+      log.push({ chunk: ci + 1, action: 'detection_error', error: e.message });
+      results.push(humanized);
+      continue;
+    }
+
+    log.push({ chunk: ci + 1, round: 0, full_human: Math.round(fullScore.human * 1000) / 1000 });
+
+    if (fullScore.human >= targetHuman) {
+      log.push({ chunk: ci + 1, action: 'passed_first_try', human: fullScore.human });
+      results.push(humanized);
+      continue;
+    }
+
+    // Step 3: Break into paragraphs, score each
+    for (let round = 1; round <= maxRounds; round++) {
+      const paragraphs = splitParagraphs(humanized);
+      const scored = [];
+
+      for (let pi = 0; pi < paragraphs.length; pi++) {
+        const p = paragraphs[pi];
+        if (p.length < 30) {
+          scored.push({ idx: pi, text: p, human: 1, ai: 0, pass: true });
+          continue;
+        }
         try {
-          detection = await detectSentences(humanized, hfToken);
-        } catch (err) {
-          log.push({ chunk: i + 1, retry, action: 'detection_error', error: err.message });
-          break;
-        }
-
-        log.push({
-          chunk: i + 1,
-          retry,
-          human_score: Math.round(detection.human_score * 1000) / 1000,
-          flagged_count: detection.flagged.length,
-          passed: detection.passed,
-        });
-
-        // Target met — we're done
-        if (detection.passed || detection.human_score >= targetHumanScore) {
-          log.push({ chunk: i + 1, action: 'passed', final_human_score: detection.human_score });
-          break;
-        }
-
-        // Max retries hit
-        if (retry === maxRetries - 1) {
-          log.push({ chunk: i + 1, action: 'max_retries', final_human_score: detection.human_score });
-          break;
-        }
-
-        // Step 3: Escalating rewrite strategies
-        try {
-          const prevScore = detection.human_score;
-          
-          if (detection.flagged.length > 0) {
-            // Strategy A: Targeted rewrite of flagged sentences
-            const flaggedList = detection.flagged
-              .sort((a, b) => b.ai_score - a.ai_score)
-              .slice(0, 5)
-              .map(s => `- "${s.text}" (${Math.round(s.ai_score * 100)}% AI)`)
-              .join('\n');
-
-            const prompt = REWRITE_FLAGGED_PROMPT
-              .replace('{flagged}', flaggedList)
-              .replace('{text}', humanized);
-            humanized = await llm.complete(SYSTEM_PROMPT, prompt, 0.9 + (retry * 0.015));
-            log.push({ chunk: i + 1, action: 'targeted_rewrite', flagged: detection.flagged.length });
-
-          } else if (retry < 4) {
-            // Strategy B: Style rewrite — add personality
-            humanized = await llm.complete(
-              SYSTEM_PROMPT,
-              'This text scores ' + Math.round(detection.human_score * 100) + '% human but needs 98%+. The AI classifier detects uniform statistical patterns in the OVERALL text even though individual sentences pass. Make it messier — interrupt yourself mid-thought, add a random aside, use a run-on sentence, throw in something oddly specific. DO NOT add fluff or length. Just make the rhythm more chaotic and human:\n\n' + humanized,
-              0.95
-            );
-            log.push({ chunk: i + 1, action: 'style_rewrite' });
-
-          } else if (retry < 8) {
-            // Strategy C: Nuclear — full rewrite from scratch using original input
-            humanized = await llm.complete(
-              SYSTEM_PROMPT,
-              'COMPLETELY rewrite this from scratch. Same meaning, totally different words and structure. Write it like you\'re explaining it to a friend over coffee — messy, casual, with tangents and personality. Temperature: chaotic. The previous version kept scoring as AI-generated, so you CANNOT reuse the same phrases or patterns:\n\n' + chunk.text,
-              0.98
-            );
-            log.push({ chunk: i + 1, action: 'nuclear_rewrite' });
-
-          } else {
-            // Strategy D: Last resort — rewrite as stream of consciousness
-            humanized = await llm.complete(
-              'You are rewriting text to sound like a real person\'s internal monologue typed out in a Slack message. Use sentence fragments. Start sentences with conjunctions. Include parenthetical asides. Make it feel unpolished and authentic. Vary sentence length between 3 words and 40 words. Output ONLY the rewritten text.',
-              'Rewrite this, same core ideas but totally unpolished human voice:\n\n' + chunk.text,
-              1.0
-            );
-            log.push({ chunk: i + 1, action: 'stream_of_consciousness_rewrite' });
-          }
-        } catch (err) {
-          log.push({ chunk: i + 1, action: 'rewrite_error', error: err.message });
-          break;
+          const s = await hfScore(p, hfToken);
+          scored.push({ idx: pi, text: p, human: s.human, ai: s.ai, pass: s.human >= 0.85 });
+        } catch (e) {
+          scored.push({ idx: pi, text: p, human: 0.5, ai: 0.5, pass: true }); // skip on error
         }
       }
-    } else {
-      log.push({ chunk: i + 1, action: 'no_hf_token_skip_detection' });
+
+      const failing = scored.filter(s => !s.pass).sort((a, b) => a.human - b.human);
+      log.push({
+        chunk: ci + 1,
+        round,
+        paragraphs: paragraphs.length,
+        failing: failing.length,
+        scores: scored.map(s => ({ human: Math.round(s.human * 100), pass: s.pass })),
+      });
+
+      if (failing.length === 0) {
+        // All paragraphs pass individually — check full text
+        const reassembled = scored.map(s => s.text).join('\n\n');
+        const fs = await hfScore(reassembled, hfToken);
+        log.push({ chunk: ci + 1, round, full_human: Math.round(fs.human * 1000) / 1000 });
+
+        if (fs.human >= targetHuman) {
+          humanized = reassembled;
+          log.push({ chunk: ci + 1, action: 'passed', human: fs.human });
+          break;
+        }
+
+        // Full text fails but paragraphs pass — need structural diversity
+        if (round <= maxRounds - 1) {
+          try {
+            humanized = await llm.complete(
+              SYSTEM_PROMPT,
+              `This text scores ${Math.round(fs.human * 100)}% human. Individual paragraphs pass but the overall text still reads as AI because the paragraphs have similar rhythm and structure to each other. Fix this by making each paragraph DRASTICALLY different in style:
+- One paragraph should be very short (1-2 sentences)
+- One should be a long run-on thought
+- One should start with a question or exclamation
+- Mix formal and casual within the same piece
+- Add one unexpected aside or tangent
+
+Text:\n\n${reassembled}`,
+              0.95
+            );
+            log.push({ chunk: ci + 1, action: 'structural_diversity_rewrite' });
+          } catch (e) {
+            log.push({ chunk: ci + 1, action: 'rewrite_error', error: e.message });
+            break;
+          }
+        }
+        continue;
+      }
+
+      // Rewrite only the failing paragraphs
+      const newParagraphs = [...paragraphs];
+      for (const fail of failing) {
+        const temp = Math.min(0.9 + (round * 0.02), 1.0);
+        try {
+          let rewritePrompt;
+          if (round <= 3) {
+            rewritePrompt = `This paragraph scores ${Math.round(fail.human * 100)}% human (needs 85%+). Rewrite it to sound like a real person — messy rhythm, unexpected words, imperfections. Same meaning, different delivery. DO NOT use smooth transitions or uniform sentence lengths.
+
+Examples of paragraphs that score 95%+ human:
+- "Deleted like 4000 files off my phone yesterday. Chaotically. No regrets."
+- "The API is solid but the docs are hot garbage. Spent 3 hours on something that should've taken 20 minutes and I'm still kind of mad about it honestly."
+
+Paragraph to rewrite:
+${fail.text}`;
+          } else if (round <= 7) {
+            rewritePrompt = `COMPLETELY rewrite this paragraph from scratch. Same core idea, totally different words. Write it like a Slack message to a coworker — casual, fragmented, real. Score: ${Math.round(fail.human * 100)}% human (need 85%+).
+
+${fail.text}`;
+          } else {
+            rewritePrompt = `Rewrite as stream of consciousness. Same idea. Messy. Fragments ok. Tangents ok. Make it feel TYPED not COMPOSED.
+
+${fail.text}`;
+          }
+          const rewritten = await llm.complete(SYSTEM_PROMPT, rewritePrompt, temp);
+          newParagraphs[fail.idx] = rewritten.trim();
+          log.push({ chunk: ci + 1, round, para: fail.idx, action: 'rewrite', from_human: Math.round(fail.human * 100) });
+        } catch (e) {
+          log.push({ chunk: ci + 1, round, para: fail.idx, action: 'rewrite_error', error: e.message });
+        }
+      }
+
+      // Reassemble and score full text
+      humanized = newParagraphs.join('\n\n');
+      try {
+        fullScore = await hfScore(humanized, hfToken);
+        log.push({ chunk: ci + 1, round, full_human: Math.round(fullScore.human * 1000) / 1000 });
+      } catch (e) {
+        log.push({ chunk: ci + 1, round, action: 'full_score_error', error: e.message });
+        continue;
+      }
+
+      if (fullScore.human >= targetHuman) {
+        log.push({ chunk: ci + 1, action: 'passed', human: fullScore.human });
+        break;
+      }
+
+      if (round === maxRounds) {
+        log.push({ chunk: ci + 1, action: 'max_rounds', final_human: fullScore.human });
+      }
     }
 
     results.push(humanized);
@@ -503,16 +541,15 @@ async function humanize(text, options = {}) {
 
   const output = results.join('\n\n');
 
-  // Final full-text detection score
+  // Final full-text detection
   let finalDetection = null;
   if (hfToken) {
     try {
-      const { detect } = require('./detector');
       const proseOnly = chunks.reduce((acc, chunk, idx) => {
         if (chunk.type === 'prose') acc += results[idx] + '\n\n';
         return acc;
       }, '').trim();
-      finalDetection = await detect(proseOnly, hfToken, { hf_token: hfToken });
+      finalDetection = await hfScore(proseOnly, hfToken);
     } catch (e) {
       finalDetection = { error: e.message };
     }
